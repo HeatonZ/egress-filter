@@ -8,6 +8,9 @@
 package pool
 
 import (
+	"context"
+	"errors"
+	"net"
 	"sync"
 	"time"
 )
@@ -28,10 +31,13 @@ const (
 	VerdictOK
 	// VerdictBlocked means the upstream refused this egress specifically.
 	VerdictBlocked
-	// VerdictBadRequest means the request shape was rejected. This is a
-	// configuration problem, not an egress problem, so it must not condemn the
-	// route.
+	// VerdictBadRequest means the request shape was rejected.
 	VerdictBadRequest
+	// VerdictServerError means the upstream answered non-2xx (5xx, 429, an
+	// unclassified 403). It counts like any other failure.
+	VerdictServerError
+	// VerdictTimeout means the route did not deliver a response in time.
+	VerdictTimeout
 )
 
 func (v Verdict) String() string {
@@ -42,6 +48,10 @@ func (v Verdict) String() string {
 		return "blocked"
 	case VerdictBadRequest:
 		return "bad_request"
+	case VerdictServerError:
+		return "server_error"
+	case VerdictTimeout:
+		return "timeout"
 	default:
 		return "unknown"
 	}
@@ -298,7 +308,11 @@ func (p *Pool) Record(key string, v Verdict, latency time.Duration, detail strin
 			e.state = StateReady
 		}
 
-	case VerdictBlocked:
+	default:
+		// Every other verdict is a failure: the route did not serve the request.
+		// 4xx, 5xx, timeout and dial failure stay distinguishable in lastDetail
+		// for operators, but the count does not care — five in a row withdraws
+		// the route whatever produced them.
 		e.consecFail++
 		e.consecOK = 0
 		if e.consecFail >= p.opts.FailThreshold {
@@ -306,20 +320,17 @@ func (p *Pool) Record(key string, v Verdict, latency time.Duration, detail strin
 		} else {
 			e.state = StateSuspect
 		}
-
-	case VerdictUnknown:
-		e.consecFail++
-		e.consecOK = 0
-		if e.consecFail >= p.opts.FailThreshold {
-			e.state = StateBlocked
-		} else {
-			e.state = StateSuspect
-		}
-
-	case VerdictBadRequest:
-		// The egress was never exercised: the upstream rejected the request
-		// shape before routing it. Reset nothing and condemn nothing.
 	}
+}
+
+// IsTimeout reports whether err is a deadline rather than a refusal, so callers
+// can tell a stalled egress apart from one that rejected the connection.
+func IsTimeout(err error) bool {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 // Blocked reports whether the route has been withdrawn from selection.

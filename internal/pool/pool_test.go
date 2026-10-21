@@ -1,6 +1,8 @@
 package pool
 
 import (
+	"io"
+	"os"
 	"testing"
 	"time"
 )
@@ -74,21 +76,21 @@ func TestSuccessResetsFailureStreak(t *testing.T) {
 	}
 }
 
-// BadRequest means the request shape was wrong. It says nothing about the
-// egress, so it must leave the route's health untouched.
-func TestBadRequestIsNotEvidence(t *testing.T) {
+// Every verdict except OK is a failure, so a 400 withdraws the route too.
+func TestBadRequestCountsTowardWithdrawal(t *testing.T) {
 	p := testPool()
 	seed(p, "a")
 	p.Record("a", VerdictOK, time.Millisecond, "ok")
-	before := p.Snapshots()[0]
 
-	for i := 0; i < 5; i++ {
-		p.Record("a", VerdictBadRequest, time.Millisecond, "shape")
+	for i := 0; i < defaultThreshold; i++ {
+		p.Record("a", VerdictBadRequest, time.Millisecond, "upstream 400")
 	}
 	after := p.Snapshots()[0]
-	if after.State != before.State || after.ConsecOK != before.ConsecOK {
-		t.Fatalf("bad_request changed health: before %v/%d after %v/%d",
-			before.State, before.ConsecOK, after.State, after.ConsecOK)
+	if after.State != StateBlocked {
+		t.Fatalf("state after the threshold = %v, want blocked", after.State)
+	}
+	if after.ConsecOK != 0 {
+		t.Fatalf("a failure left the success streak at %d, want 0", after.ConsecOK)
 	}
 }
 
@@ -261,5 +263,52 @@ func TestClaimEvictionRequiresBlockedVerdict(t *testing.T) {
 	}
 	if p.ClaimEviction("a", time.Minute) {
 		t.Fatal("an unreachable route must not be evicted; only a blocked egress may")
+	}
+}
+
+// A timeout is a failure like any other and withdraws the route after the
+// threshold, exactly as a blocked verdict does.
+func TestTimeoutCountsTowardWithdrawal(t *testing.T) {
+	p := testPool()
+	seed(p, "a", "b")
+
+	for i := 0; i < defaultThreshold; i++ {
+		p.Record("a", VerdictTimeout, time.Second, "read response: i/o timeout")
+	}
+	snap := p.Snapshots()
+	if snap[0].State != StateBlocked || snap[0].LastVerdict != VerdictTimeout {
+		t.Fatalf("want a blocked on timeout, got %v (%v)", snap[0].State, snap[0].LastVerdict)
+	}
+	if snap[1].State != StateReady {
+		t.Fatalf("the untouched route was demoted: %v", snap[1].State)
+	}
+}
+
+// A 5xx withdraws the route the same way, and one success clears the streak.
+func TestServerErrorCountsAndSuccessResetsIt(t *testing.T) {
+	p := testPool()
+	seed(p, "a")
+
+	for i := 0; i < defaultThreshold-1; i++ {
+		p.Record("a", VerdictServerError, time.Second, "upstream 5xx")
+	}
+	p.Record("a", VerdictOK, time.Millisecond, "served live traffic")
+	if got := p.Snapshots()[0].State; got != StateReady {
+		t.Fatalf("state after a success = %v, want ready", got)
+	}
+	for i := 0; i < defaultThreshold; i++ {
+		p.Record("a", VerdictServerError, time.Second, "upstream 5xx")
+	}
+	if got := p.Snapshots()[0].State; got != StateBlocked {
+		t.Fatalf("state after the threshold = %v, want blocked", got)
+	}
+}
+
+func TestIsTimeoutRecognisesDeadlines(t *testing.T) {
+	if IsTimeout(io.EOF) {
+		t.Fatal("EOF is a refusal, not a deadline")
+	}
+	if !IsTimeout(os.ErrDeadlineExceeded) {
+		t.Fatal("os.ErrDeadlineExceeded must count as a timeout")
 	}
 }

@@ -43,6 +43,10 @@ type Terminator struct {
 
 	// CaptureBytes bounds how much of a non-2xx body is read for classification.
 	CaptureBytes int64
+	// HeaderTimeout bounds the wait for response headers. An egress that
+	// accepts the connection and then stalls would otherwise pin the goroutine
+	// forever and never produce a verdict. Zero disables the bound.
+	HeaderTimeout time.Duration
 	// Evictor is notified when live traffic proves an egress blocked.
 	Evictor Evictor
 	// UpstreamRoots verifies the upstream certificate. Nil means system roots.
@@ -171,6 +175,7 @@ func (t *Terminator) roundTrip(client *tls.Conn, req *http.Request, host, port, 
 	if err != nil {
 		t.Pool.SetError(route.Key, err.Error())
 		t.Pool.Record(route.Key, pool.VerdictUnknown, 0, "egress dial: "+err.Error())
+		t.evictIfBlocked(route.Key)
 		writeStatus(client, http.StatusBadGateway, "egress unreachable")
 		return false
 	}
@@ -185,6 +190,7 @@ func (t *Terminator) roundTrip(client *tls.Conn, req *http.Request, host, port, 
 	})
 	if err := tlsUp.Handshake(); err != nil {
 		t.Pool.Record(route.Key, pool.VerdictUnknown, 0, "upstream tls: "+err.Error())
+		t.evictIfBlocked(route.Key)
 		writeStatus(client, http.StatusBadGateway, "upstream tls failed")
 		return false
 	}
@@ -194,12 +200,23 @@ func (t *Terminator) roundTrip(client *tls.Conn, req *http.Request, host, port, 
 		return false
 	}
 
+	if t.HeaderTimeout > 0 {
+		// Applied only until the status line and headers arrive: a streaming
+		// body legitimately runs far longer than a header deadline.
+		tlsUp.SetReadDeadline(time.Now().Add(t.HeaderTimeout))
+	}
 	start := time.Now()
 	resp, err := http.ReadResponse(bufio.NewReader(tlsUp), req)
 	if err != nil {
-		t.Pool.Record(route.Key, pool.VerdictUnknown, time.Since(start), "read response: "+err.Error())
+		verdict := pool.VerdictUnknown
+		if pool.IsTimeout(err) {
+			verdict = pool.VerdictTimeout
+		}
+		t.Pool.Record(route.Key, verdict, time.Since(start), "read response: "+err.Error())
+		t.evictIfBlocked(route.Key)
 		return false
 	}
+	tlsUp.SetReadDeadline(time.Time{})
 	defer resp.Body.Close()
 
 	// Capture the body prefix by wrapping the reader rather than reading ahead:
@@ -236,22 +253,33 @@ func (t *Terminator) observe(key string, status int, encoding string, prefix []b
 		res := probe.Classify(status, probe.Decode(prefix, encoding), latency)
 		if res.Verdict == pool.VerdictBlocked {
 			t.Pool.Record(key, pool.VerdictBlocked, latency, res.Detail)
-			// Only ask for deletion once the threshold is actually reached. The
+			// Only ask for deletion once the threshold is actually reached; the
 			// scheduler's ClaimEviction would also refuse below it, but handing
-			// every single blocked response to it would queue pointless work and
-			// make the evictor's log look like it fired on one failure.
+			// every single blocked response over would queue pointless work.
 			if t.Evictor != nil && t.Pool.Blocked(key) {
 				t.Log.Info("egress blocked by live traffic", "route", key, "detail", res.Detail)
-				t.Evictor.Evict(key)
 			}
 		}
+		t.evictIfBlocked(key)
 		return
 	}
 	if status == http.StatusBadRequest {
-		t.Pool.Record(key, pool.VerdictBadRequest, latency, "upstream rejected request content")
+		t.Pool.Record(key, pool.VerdictBadRequest, latency, "upstream 400")
+		t.evictIfBlocked(key)
 		return
 	}
-	// 429 and 5xx say nothing about the egress.
+	// Every remaining non-2xx — 429, 5xx, an unclassified 403 — is a failure.
+	t.Pool.Record(key, pool.VerdictServerError, latency, "upstream "+strconv.Itoa(status))
+	t.evictIfBlocked(key)
+}
+
+// evictIfBlocked hands a route that just reached the threshold to the evictor,
+// whatever produced the failures: a withdrawn route can only come back through
+// a fresh lease.
+func (t *Terminator) evictIfBlocked(key string) {
+	if t.Evictor != nil && t.Pool.Blocked(key) {
+		t.Evictor.Evict(key)
+	}
 }
 
 // authorized reports whether pass is this entry's own password. The entry is an

@@ -105,9 +105,10 @@ func TestPassiveDetectsBlockedEgress(t *testing.T) {
 	}
 }
 
-// A 403 whose body says the request shape was wrong is a configuration
-// problem. Acting on it would drain the pool for nothing.
-func TestPassiveIgnoresShapeRejection(t *testing.T) {
+// A 403 whose body blames the request shape still means this route did not
+// serve the request, so it counts: five in a row withdraw the route, exactly
+// like a blocked egress.
+func TestPassiveShapeRejectionCounts(t *testing.T) {
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gzipped(t, w, 403, `{"type":"error","error":{"type":"FreeTierError","message":`+
 			`"OpenCode's free tier can only be used from within OpenCode. Download it at `+
@@ -131,16 +132,10 @@ func TestPassiveIgnoresShapeRejection(t *testing.T) {
 		resp.Body.Close()
 	}
 
-	for _, s := range p.Snapshots() {
-		if s.Key != "leaseA" {
-			continue
-		}
-		if s.State != pool.StateReady {
-			t.Fatalf("shape rejection changed state to %v; it must be ignored", s.State)
-		}
-	}
-	if ev.count() != 0 {
-		t.Fatalf("shape rejection triggered %d evictions; it must trigger none", ev.count())
+	// The verdict is applied after the response is written, so wait for it.
+	waitFor(t, func() bool { return snapshotOf(p, "leaseA").State == pool.StateBlocked })
+	if ev.count() == 0 {
+		t.Fatal("a withdrawn route was never handed to the evictor")
 	}
 }
 
@@ -194,9 +189,9 @@ func TestPassiveSuccessClearsFailures(t *testing.T) {
 	})
 }
 
-// 400 means the egress carried the request and the upstream rejected its
-// content (context length is the common case). It must not count as a failure.
-func TestPassiveBadRequestIsNotFailure(t *testing.T) {
+// 400 counts too: the route did not serve the request. Four of them leave the
+// route on probation, the fifth withdraws it.
+func TestPassiveBadRequestCounts(t *testing.T) {
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gzipped(t, w, 400, `{"error":{"type":"invalid_request_error","message":"context_length_exceeded"}}`)
 	}))
@@ -215,14 +210,15 @@ func TestPassiveBadRequestIsNotFailure(t *testing.T) {
 		}
 	}
 	for _, s := range p.Snapshots() {
-		if s.Key == "leaseA" && s.State != pool.StateReady {
-			t.Fatalf("context-length 400 demoted the route to %v", s.State)
+		if s.Key == "leaseA" && s.State != pool.StateSuspect {
+			t.Fatalf("four 400s left the route in %v, want suspect", s.State)
 		}
 	}
 }
 
-// 5xx is the upstream's own problem; the egress is fine.
-func TestPassiveServerErrorIsNotEvidence(t *testing.T) {
+// A 5xx is a failure like any other: five in a row withdraw the route, because
+// a route that keeps returning 5xx is not serving traffic whatever the cause.
+func TestPassiveServerErrorCounts(t *testing.T) {
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(502)
 	}))
@@ -233,17 +229,22 @@ func TestPassiveServerErrorIsNotEvidence(t *testing.T) {
 	srv := httptest.NewServer(r)
 	defer srv.Close()
 
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 5; i++ {
 		resp, _ := http.Get(srv.URL + "/tok/opencode.leaseA/https/opencode.ai/x")
 		if resp != nil {
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 		}
 	}
-	for _, s := range p.Snapshots() {
-		if s.Key == "leaseA" && s.State != pool.StateReady {
-			t.Fatalf("502 demoted the route to %v; only a blocked egress may", s.State)
-		}
+	states := map[string]pool.State{}
+	for _, snap := range p.Snapshots() {
+		states[snap.Key] = snap.State
+	}
+	if states["leaseA"] != pool.StateBlocked {
+		t.Fatalf("five 502s left leaseA in %v, want blocked", states["leaseA"])
+	}
+	if states["leaseB"] != pool.StateReady {
+		t.Fatalf("leaseB was demoted to %v although it never failed", states["leaseB"])
 	}
 }
 

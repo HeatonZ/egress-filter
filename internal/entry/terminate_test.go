@@ -159,9 +159,9 @@ func TestTerminateSuccessRecordsOK(t *testing.T) {
 	}
 }
 
-// A 429 is rate limiting, not a dead egress. Counting it would withdraw every
-// route the moment the free tier throttles.
-func TestTerminateIgnoresRateLimit(t *testing.T) {
+// A 429 counts like every other non-2xx: the route did not serve the request,
+// so five in a row rotate it.
+func TestTerminateCountsRateLimit(t *testing.T) {
 	up := upstreamServer(t, http.StatusTooManyRequests,
 		`{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded."}}`, nil)
 	p := seeded()
@@ -175,11 +175,11 @@ func TestTerminateIgnoresRateLimit(t *testing.T) {
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
-	waitFor(t, func() bool { return snapshotOf(p, "leaseA").ConsecOK > 0 })
+	waitFor(t, func() bool { return snapshotOf(p, "leaseA").ConsecFail > 0 })
 	s0 := snapshotOf(p, "leaseA")
-	if s0.ConsecFail != 0 {
-		t.Fatalf("429 counted as %d failures, want 0 (state=%v verdict=%v detail=%q)",
-			s0.ConsecFail, s0.State, s0.LastVerdict, s0.LastError)
+	if s0.ConsecFail != 1 || s0.State != pool.StateSuspect {
+		t.Fatalf("429 recorded as %d failures in state %v, want 1 failure in suspect",
+			s0.ConsecFail, s0.State)
 	}
 }
 
@@ -588,5 +588,54 @@ func TestForwardAllowsNoAuthWhenNoPassword(t *testing.T) {
 	}
 	if reply[1] != 0x00 {
 		t.Fatalf("method reply = %v, want no-auth accepted", reply)
+	}
+}
+
+// An egress that accepts the connection and then never answers must not pin the
+// goroutine forever: the header deadline fires, the attempt is recorded as a
+// timeout, and the route goes on probation.
+func TestTerminateTimesOutAndCounts(t *testing.T) {
+	// The handler parks until the test releases it, so httptest.Server.Close
+	// cannot deadlock waiting for a request that never ends.
+	release := make(chan struct{})
+	up := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	up.StartTLS()
+	defer func() { close(release); up.Close() }()
+
+	p := seeded()
+	tt := newTestTerminator(t, p, &recordingEvictor{})
+	tt.dial = directTo(t, up)
+	tt.UpstreamRoots = rootsFor(t, up)
+	tt.HeaderTimeout = 150 * time.Millisecond
+	proxy := httptest.NewServer(tt)
+	defer proxy.Close()
+
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(tt.CA.CertPEM()) {
+		t.Fatal("test ca is not valid pem")
+	}
+	u := mustURL(t, proxy.URL)
+	u.User = url.UserPassword("opencode.leaseA", testProxyToken)
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			Proxy:           http.ProxyURL(u),
+			TLSClientConfig: &tls.Config{RootCAs: roots},
+		},
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://"+upstreamHost(up)+"/v1/chat/completions",
+		strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp, err := client.Do(req); err == nil {
+		resp.Body.Close()
+	}
+
+	waitFor(t, func() bool { return snapshotOf(p, "leaseA").LastVerdict == pool.VerdictTimeout })
+	if got := snapshotOf(p, "leaseA").State; got != pool.StateSuspect {
+		t.Fatalf("state after one timeout = %v, want suspect", got)
 	}
 }

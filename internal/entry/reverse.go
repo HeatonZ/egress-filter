@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -129,9 +130,16 @@ func (r *Reverse) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
 	resp, err := r.Transport.RoundTrip(out)
 	if err != nil {
-		// A transport failure is real evidence about the route.
+		// A transport failure is real evidence about the route. A deadline is
+		// recorded separately because it needs the upstream-alive guard: a slow
+		// upstream stalls every route, a broken one only this route.
 		r.Pool.SetError(route.Key, err.Error())
-		r.Pool.Record(route.Key, pool.VerdictUnknown, time.Since(start), "reverse transport: "+err.Error())
+		verdict := pool.VerdictUnknown
+		if pool.IsTimeout(err) {
+			verdict = pool.VerdictTimeout
+		}
+		r.Pool.Record(route.Key, verdict, time.Since(start), "reverse transport: "+err.Error())
+		r.evictIfBlocked(route.Key)
 		http.Error(w, `{"error":"upstream unreachable"}`, http.StatusBadGateway)
 		return
 	}
@@ -200,11 +208,19 @@ func (r *Reverse) choose(requested string, h http.Header) (pool.Route, string) {
 // reuse the same classifier the prober uses. Writing a second interpretation
 // here is how the two paths drift apart and start disagreeing about a route.
 //
-// A 403 is recorded only when its body says the egress is blocked. An
-// unreadable or unrecognised 403 stays silent: the same status also covers a
-// malformed request, and condemning a route on that would drain the pool.
+// A 403 whose body says the egress is blocked is recorded as such; every other
+// non-2xx — including a 403 that blames the request shape — counts as a plain
+// failure. One success clears the streak, so a single odd response cannot
+// withdraw a route.
 func (r *Reverse) observe(key string, status int, encoding string, prefix []byte, latency time.Duration, streamErr error) {
 	if status >= 200 && status < 300 {
+		if streamErr != nil {
+			// The status was fine but the body broke: the egress did not carry
+			// the whole answer, so this is a failure rather than a success.
+			r.Pool.Record(key, pool.VerdictUnknown, latency, "stream error: "+streamErr.Error())
+			r.evictIfBlocked(key)
+			return
+		}
 		r.Pool.Record(key, pool.VerdictOK, latency, "served live traffic")
 		return
 	}
@@ -215,29 +231,32 @@ func (r *Reverse) observe(key string, status int, encoding string, prefix []byte
 		if res.Verdict == pool.VerdictBlocked {
 			r.Pool.Record(key, pool.VerdictBlocked, latency, res.Detail)
 			r.Log.Info("egress blocked by live traffic", "route", key, "detail", res.Detail)
-			if r.Evictor != nil {
-				r.Evictor.Evict(key)
-			}
+			r.evictIfBlocked(key)
 			return
 		}
-		// bad_request or unclassified: not evidence about the egress.
-		return
+		// A 403 that is not the egress being blocked is still a request this
+		// route failed to serve, so it falls through to the failure below.
 	}
 
 	if status == http.StatusBadRequest {
 		// The egress carried the request; the upstream rejected its content
 		// (context length, malformed body).
-		r.Pool.Record(key, pool.VerdictBadRequest, latency, "upstream rejected request content")
+		r.Pool.Record(key, pool.VerdictBadRequest, latency, "upstream 400")
+		r.evictIfBlocked(key)
 		return
 	}
 
-	if status >= 500 {
-		// Upstream-side failure: says nothing about the egress.
-		return
-	}
+	// Every remaining non-2xx — 429, 5xx, an unclassified 403 — is a failure.
+	r.Pool.Record(key, pool.VerdictServerError, latency, "upstream "+strconv.Itoa(status))
+	r.evictIfBlocked(key)
+}
 
-	if streamErr != nil {
-		r.Pool.Record(key, pool.VerdictUnknown, latency, "stream error: "+streamErr.Error())
+// evictIfBlocked hands a route that just reached the threshold to the evictor,
+// whatever produced the failures: a withdrawn route can only come back through
+// a fresh lease, so the deletion is what makes the rotation real.
+func (r *Reverse) evictIfBlocked(key string) {
+	if r.Evictor != nil && r.Pool.Blocked(key) {
+		r.Evictor.Evict(key)
 	}
 }
 

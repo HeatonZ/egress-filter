@@ -75,6 +75,9 @@ func main() {
 
 	rev := entry.NewReverse(p, cfg.ResinURL, cfg.Platform, log)
 	rev.Upstreams = registry
+	if cfg.HeaderTimeout > 0 {
+		rev.Transport.ResponseHeaderTimeout = cfg.HeaderTimeout
+	}
 
 	fwd := &entry.Forward{
 		Pool:        p,
@@ -172,15 +175,16 @@ func main() {
 		} else {
 			termLn = ln
 			term := &entry.Terminator{
-				Pool:        p,
-				Log:         log,
-				CA:          ca,
-				Upstream:    cfg.ProxyAddr,
-				Token:       cfg.Password,
-				Upstreams:   registry,
-				Platform:    cfg.Platform,
-				DialTimeout: 15 * time.Second,
-				Evictor:     sched,
+				Pool:          p,
+				Log:           log,
+				CA:            ca,
+				Upstream:      cfg.ProxyAddr,
+				Token:         cfg.Password,
+				Upstreams:     registry,
+				Platform:      cfg.Platform,
+				DialTimeout:   15 * time.Second,
+				HeaderTimeout: cfg.HeaderTimeout,
+				Evictor:       sched,
 			}
 			termSrv := &http.Server{Handler: term, ReadHeaderTimeout: 30 * time.Second}
 			go func() {
@@ -239,6 +243,9 @@ type config struct {
 	EvictCooldown     time.Duration
 	// LazyTTL expires a route a client named that discovery never lists.
 	LazyTTL time.Duration
+	// HeaderTimeout bounds how long one egress may take to answer with
+	// response headers before the attempt counts as a timeout.
+	HeaderTimeout time.Duration
 }
 
 // upstreamConfig describes one Resin instance. It is the JSON shape accepted by
@@ -274,6 +281,7 @@ func loadConfig() config {
 		Evict:             boolean("EF_EVICT", false),
 		EvictCooldown:     duration("EF_EVICT_COOLDOWN", 10*time.Minute),
 		LazyTTL:           duration("EF_LAZY_TTL", 10*time.Minute),
+		HeaderTimeout:     duration("EF_UPSTREAM_HEADER_TIMEOUT", 60*time.Second),
 	}
 	// The aggregator password defaults to the old single-instance token so an
 	// existing deployment keeps working without a new variable.
