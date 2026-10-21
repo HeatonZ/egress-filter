@@ -32,8 +32,11 @@ type Evictor interface {
 // Reverse proxies HTTP requests through a chosen lease.
 type Reverse struct {
 	Pool     *pool.Pool
-	Upstream string // e.g. http://resin:2260
-	Platform string // e.g. opencode
+	Upstream string // e.g. http://resin:2260 fallback
+	// Upstreams resolves a route to its Resin instance, so several instances can
+	// sit behind one reverse entry.
+	Upstreams Upstreams
+	Platform  string // e.g. opencode
 
 	// Transport is shared across requests so connections are reused. Without
 	// this, every SSE stream would pay a fresh TCP+TLS handshake to the
@@ -103,7 +106,11 @@ func (r *Reverse) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if rest != "" {
 		targetPath += "/" + rest
 	}
-	target := r.Upstream + targetPath
+	base := r.Upstream
+	if up, ok := r.Upstreams.Resolve(route.Upstream); ok && up.BaseURL != "" {
+		base = up.BaseURL
+	}
+	target := base + targetPath
 	if req.URL.RawQuery != "" {
 		target += "?" + req.URL.RawQuery
 	}

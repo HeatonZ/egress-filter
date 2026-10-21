@@ -9,6 +9,7 @@ package app
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,13 +32,27 @@ type Config struct {
 	EvictCooldown time.Duration
 }
 
+// Source is one Resin instance discovery reads leases from. Several may be
+// configured: each keeps its own control-plane client and platform id, and the
+// routes it contributes carry its name so the data path can dial the right
+// instance with the right password.
+type Source struct {
+	Name       string
+	Client     *resin.Client
+	PlatformID string
+}
+
 // Scheduler keeps the pool's route set in sync with Resin and applies
 // evictions requested by the data path.
 type Scheduler struct {
 	Pool  *pool.Pool
 	Resin *resin.Client
-	Cfg   Config
-	Log   *slog.Logger
+	// Sources are the Resin instances to read leases from. When empty the
+	// single Resin client plus Cfg.PlatformID is used, so existing deployments
+	// keep working unchanged.
+	Sources []Source
+	Cfg     Config
+	Log     *slog.Logger
 
 	// evictCh carries accounts the reverse entry has condemned. It is buffered
 	// and written without blocking: the request path must never wait on the
@@ -47,6 +62,9 @@ type Scheduler struct {
 	mu      sync.Mutex
 	evicted int64
 	failed  int64
+	// owners maps a route key to the instance that produced it, so eviction
+	// deletes from the right control plane.
+	owners map[string]Source
 }
 
 // New builds a scheduler.
@@ -92,27 +110,59 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}
 }
 
-// discover refreshes the route set from Resin.
+// sources returns the configured instances, defaulting to the single client.
+func (s *Scheduler) sources() []Source {
+	if len(s.Sources) > 0 {
+		return s.Sources
+	}
+	if s.Resin == nil {
+		return nil
+	}
+	return []Source{{Name: "default", Client: s.Resin, PlatformID: s.Cfg.PlatformID}}
+}
+
+// discover refreshes the route set from every configured Resin instance.
 func (s *Scheduler) discover(ctx context.Context) {
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	leases, err := s.Resin.Leases(cctx, s.Cfg.PlatformID)
-	if err != nil {
-		s.Log.Warn("lease discovery failed", "error", err)
-		return
-	}
-	routes := make([]pool.Route, 0, len(leases))
-	for _, l := range leases {
-		if l.Account == "" {
+	sources := s.sources()
+	// With one instance the key stays the bare account, so existing status
+	// output and eviction cooldowns are unchanged. With several, the name has to
+	// be part of the key or two instances holding the same account name would
+	// collapse into one route.
+	multi := len(sources) > 1
+
+	routes := make([]pool.Route, 0, 64)
+	owners := make(map[string]Source, 64)
+	for _, src := range sources {
+		leases, err := src.Client.Leases(cctx, src.PlatformID)
+		if err != nil {
+			s.Log.Warn("lease discovery failed", "upstream", src.Name, "error", err)
 			continue
 		}
-		routes = append(routes, pool.Route{
-			Key:      l.Account,
-			Lease:    l.Account,
-			EgressIP: l.EgressIP,
-		})
+		for _, l := range leases {
+			if l.Account == "" {
+				continue
+			}
+			key := l.Account
+			if multi {
+				key = src.Name + "/" + l.Account
+			}
+			routes = append(routes, pool.Route{
+				Key:      key,
+				Lease:    l.Account,
+				EgressIP: l.EgressIP,
+				Upstream: src.Name,
+			})
+			owners[key] = src
+		}
 	}
+
+	s.mu.Lock()
+	s.owners = owners
+	s.mu.Unlock()
+
 	before := s.Pool.Snapshots()
 	s.Pool.Sync(routes)
 
@@ -144,6 +194,13 @@ func (s *Scheduler) evict(ctx context.Context, account string) {
 	if cooldown <= 0 {
 		cooldown = 10 * time.Minute
 	}
+	src, lease, ok := s.ownerOf(account)
+	if !ok {
+		s.Pool.ReleaseEviction(account)
+		s.Log.Warn("evict: route has no owning upstream", "route", account)
+		return
+	}
+
 	// Claim before deleting so concurrent blocked responses for the same
 	// account collapse into one deletion.
 	if !s.Pool.ClaimEviction(account, cooldown) {
@@ -153,19 +210,46 @@ func (s *Scheduler) evict(ctx context.Context, account string) {
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	if err := s.Resin.DeleteLease(cctx, s.Cfg.PlatformID, account); err != nil {
+	if err := src.Client.DeleteLease(cctx, src.PlatformID, lease); err != nil {
 		s.Pool.ReleaseEviction(account)
 		s.mu.Lock()
 		s.failed++
 		s.mu.Unlock()
-		s.Log.Warn("delete lease failed", "account", account, "error", err)
+		s.Log.Warn("delete lease failed", "account", lease, "upstream", src.Name, "error", err)
 		return
 	}
 
 	s.mu.Lock()
 	s.evicted++
 	s.mu.Unlock()
-	s.Log.Info("evicted blocked lease", "account", account)
+	s.Log.Info("evicted blocked lease", "account", lease, "upstream", src.Name)
+}
+
+// ownerOf resolves a route key to the instance that owns it and the bare lease
+// name that instance knows. Keys only carry the instance prefix when more than
+// one instance is configured.
+func (s *Scheduler) ownerOf(key string) (Source, string, bool) {
+	s.mu.Lock()
+	src, ok := s.owners[key]
+	s.mu.Unlock()
+
+	if ok && src.Name != "" && strings.HasPrefix(key, src.Name+"/") {
+		return src, strings.TrimPrefix(key, src.Name+"/"), true
+	}
+	// The pool snapshot is authoritative for the lease name; the key is only a
+	// label once several instances are in play.
+	for _, sn := range s.Pool.Snapshots() {
+		if sn.Key == key {
+			if !ok {
+				fallback := s.sources()
+				if len(fallback) == 1 {
+					src, ok = fallback[0], true
+				}
+			}
+			return src, sn.Lease, ok
+		}
+	}
+	return Source{}, "", false
 }
 
 // Evicted returns how many lease bindings were dropped.

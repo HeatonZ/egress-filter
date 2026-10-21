@@ -32,6 +32,17 @@ func (r *recordingEvictor) count() int {
 
 // gzipped serves body the way the upstream does: compressed, so a classifier
 // that reads raw bytes sees nothing.
+// snapshotFor looks a route up by key. Snapshots order is not stable, so an
+// index-based lookup silently asserts against the wrong route.
+func snapshotFor(p *pool.Pool, key string) pool.Snapshot {
+	for _, s := range p.Snapshots() {
+		if s.Key == key {
+			return s
+		}
+	}
+	return pool.Snapshot{}
+}
+
 func gzipped(t *testing.T, w http.ResponseWriter, status int, body string) {
 	t.Helper()
 	w.Header().Set("Content-Encoding", "gzip")
@@ -76,6 +87,7 @@ func TestPassiveDetectsBlockedEgress(t *testing.T) {
 		}
 	}
 
+	waitFor(t, func() bool { return snapshotFor(p, "leaseA").ConsecFail >= 5 })
 	var snap pool.Snapshot
 	for _, s := range p.Snapshots() {
 		if s.Key == "leaseA" {

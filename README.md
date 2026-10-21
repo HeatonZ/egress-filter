@@ -88,11 +88,13 @@ Eviction is **off by default**. Run a while with `EF_EVICT=false` and read
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `EF_RESIN_URL` | `http://resin:2260` | Resin control plane and proxy |
+| `EF_PROXY_PASSWORD` | *(falls back to `EF_PROXY_TOKEN`)* | **This entry's own password.** Clients authenticate with it; it is independent of every Resin token |
+| `EF_UPSTREAMS` | *(empty)* | JSON array of Resin instances, see below; empty means one instance from the `EF_RESIN_*`/`EF_PROXY_*` vars |
+| `EF_RESIN_URL` | `http://resin:2260` | default instance's control plane and proxy |
 | `EF_RESIN_TOKEN` | — | admin token, required |
 | `EF_PLATFORM_ID` | — | platform UUID, required |
 | `EF_PLATFORM` | `opencode` | platform name used in the path and SOCKS username |
-| `EF_PROXY_TOKEN` | — | Resin proxy token used in the path |
+| `EF_PROXY_TOKEN` | — | default instance's Resin token, used for the hop to Resin |
 | `EF_LISTEN_REVERSE` | `:8080` | reverse entry |
 | `EF_LISTEN_FORWARD` | `:1080` | forward entry |
 | `EF_LISTEN_STATUS` | `:9090` | `/healthz`, `/status` |
@@ -102,6 +104,36 @@ Eviction is **off by default**. Run a while with `EF_EVICT=false` and read
 | `EF_FAIL_THRESHOLD` | `5` | consecutive blocked responses before withdrawal |
 | `EF_EVICT` | `false` | delete leases of blocked routes |
 | `EF_EVICT_COOLDOWN` | `10m` | minimum gap between deletions of one account |
+
+## Several Resin instances
+
+Set `EF_UPSTREAMS` to aggregate more than one Resin behind this entry. Each
+instance keeps its own token, and the routes it contributes carry its name, so
+the data path dials the right control plane without sharing credentials:
+
+```json
+[
+  {"name":"main","resin_url":"http://resin:2260","admin_token":"...",
+   "proxy_addr":"resin:2260","proxy_token":"...","platform_id":"<uuid>"},
+  {"name":"alt","resin_url":"http://resin2:2260","admin_token":"...",
+   "proxy_addr":"resin2:2260","proxy_token":"...","platform_id":"<uuid>"}
+]
+```
+
+Every entry keeps taking one password — `EF_PROXY_PASSWORD`. Upstream tokens stay
+in configuration and are never accepted from a client, so a leaked Resin token
+does not open this entry.
+
+With one instance a route key is the bare account, exactly as before. With
+several, keys are `name/account`, and a client that pins selects the instance by
+prefixing its proxy username:
+
+- `opencode.lease1` — any instance holding `lease1`; `auto` routing when the
+  request does not pin at all
+- `alt/opencode.lease1` — that name on instance `alt` only
+
+The qualifier matters because two instances can hold a lease of the same name;
+without it the request could be served from the wrong Resin and fail with 401.
 
 ## Endpoints
 

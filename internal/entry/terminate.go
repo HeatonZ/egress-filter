@@ -34,8 +34,10 @@ type Terminator struct {
 
 	// Upstream is Resin's SOCKS5 endpoint, used to reach the real host through
 	// the chosen egress.
-	Upstream    string
-	Token       string
+	Upstream string
+	Token    string
+	// Upstreams resolves a route to the Resin instance that owns its lease.
+	Upstreams   Upstreams
 	Platform    string
 	DialTimeout time.Duration
 
@@ -52,11 +54,11 @@ type Terminator struct {
 }
 
 // dialEgress opens the hop to target through account's egress.
-func (t *Terminator) dialEgress(account, target string) (net.Conn, error) {
+func (t *Terminator) dialEgress(route pool.Route, target string) (net.Conn, error) {
 	if t.dial != nil {
-		return t.dial(account, target)
+		return t.dial(route.Lease, target)
 	}
-	return t.dialThroughEgress(account, target)
+	return t.dialThroughEgress(route, target)
 }
 
 // ServeHTTP implements the CONNECT handshake and hands off to the tunnel.
@@ -69,6 +71,21 @@ func (t *Terminator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		host, port = req.Host, "443"
 	}
+
+	// The entry speaks the same dialect Resin does: the proxy user name is
+	// "platform.account" and the password is the shared egress token. Checking
+	// the password matters because the lease list is effectively a capability:
+	// anyone who can name a lease can spend that lease's quota.
+	user, pass, ok := parseProxyAuth(req.Header.Get("Proxy-Authorization"))
+	if !ok || !t.authorized(pass) {
+		w.Header().Set("Proxy-Authenticate", `Basic realm="egress-filter"`)
+		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
+		return
+	}
+	// The pin belongs to the tunnel, so it is read once here; a per-request
+	// X-Egress-Route header can still override it for clients that share one
+	// tunnel across several accounts.
+	pinned := user
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -105,7 +122,7 @@ func (t *Terminator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	defer tlsConn.Close()
 
-	t.handleStream(tlsConn, host, port)
+	t.handleStream(tlsConn, host, port, pinned)
 }
 
 // bufferedConn lets the TLS server read from an already-buffered reader.
@@ -118,28 +135,39 @@ func (b *bufferedConn) Read(p []byte) (int, error) { return b.r.Read(p) }
 
 // handleStream reads HTTP requests off the decrypted connection and forwards
 // each through an egress, so status codes become visible.
-func (t *Terminator) handleStream(client *tls.Conn, host, port string) {
+func (t *Terminator) handleStream(client *tls.Conn, host, port, pinned string) {
 	br := bufio.NewReader(client)
 	for {
 		req, err := http.ReadRequest(br)
 		if err != nil {
 			return
 		}
-		if !t.roundTrip(client, req, host, port) {
+		if !t.roundTrip(client, req, host, port, pinned) {
 			return
 		}
 	}
 }
 
 // roundTrip forwards one request and writes the response back.
-func (t *Terminator) roundTrip(client *tls.Conn, req *http.Request, host, port string) bool {
-	route, account := t.choose(req)
+func (t *Terminator) roundTrip(client *tls.Conn, req *http.Request, host, port, pinned string) bool {
+	// The tunnel pin is the default; a request header wins when present so a
+	// caller that multiplexes several accounts over one tunnel still works.
+	if perRequest := req.Header.Get("X-Egress-Route"); perRequest != "" {
+		pinned = perRequest
+	}
+	route, account := t.choose(pinned)
 	if account == "" {
-		writeStatus(client, http.StatusServiceUnavailable, "no healthy egress")
+		msg := "no healthy egress"
+		if pinned != "" && pinned != "auto" {
+			// The caller asked for one specific account; borrowing another
+			// egress would silently break its session affinity.
+			msg = "pinned egress unavailable"
+		}
+		writeStatus(client, http.StatusServiceUnavailable, msg)
 		return false
 	}
 
-	upstreamConn, err := t.dialEgress(account, net.JoinHostPort(host, port))
+	upstreamConn, err := t.dialEgress(route, net.JoinHostPort(host, port))
 	if err != nil {
 		t.Pool.SetError(route.Key, err.Error())
 		t.Pool.Record(route.Key, pool.VerdictUnknown, 0, "egress dial: "+err.Error())
@@ -226,34 +254,53 @@ func (t *Terminator) observe(key string, status int, encoding string, prefix []b
 	// 429 and 5xx say nothing about the egress.
 }
 
-func (t *Terminator) choose(req *http.Request) (pool.Route, string) {
-	// The egress cannot be carried in a CONNECT URL path, so callers that need
-	// to pin one send it as a header on each request.
-	if pinned := req.Header.Get("X-Egress-Route"); pinned != "" {
+// authorized reports whether pass is this entry's own password. The entry is an
+// aggregator: clients authenticate here with the token configured for it, and
+// each Resin instance behind it is reached with that instance's own token. The
+// two secrets are deliberately separate, so rotating one does not touch the other.
+func (t *Terminator) authorized(pass string) bool {
+	return t.Token != "" && pass == t.Token
+}
+
+func (t *Terminator) choose(pinned string) (pool.Route, string) {
+	upstream, lease := splitPreferred(pinned)
+	if lease != "" && lease != "auto" {
 		for _, s := range t.Pool.Snapshots() {
-			if s.Lease == pinned && s.State != pool.StateBlocked {
-				return s.Route, pinned
+			if s.Lease != lease {
+				continue
 			}
+			if upstream != "" && s.Upstream != upstream {
+				continue
+			}
+			// A withdrawn pin must fail rather than fall back: falling back is
+			// exactly the silent rerouting that makes per-account pools
+			// unpredictable under load.
+			if s.State == pool.StateBlocked {
+				return pool.Route{}, ""
+			}
+			return s.Route, s.Key
 		}
+		return pool.Route{}, ""
 	}
 	route, ok := t.Pool.Pick()
 	if !ok {
 		return pool.Route{}, ""
 	}
-	return route, route.Lease
+	return route, route.Key
 }
 
 // dialThroughEgress opens a SOCKS5 CONNECT to Resin and then to target.
-func (t *Terminator) dialThroughEgress(account, target string) (net.Conn, error) {
+func (t *Terminator) dialThroughEgress(route pool.Route, target string) (net.Conn, error) {
 	f := &Forward{
 		Pool:        t.Pool,
 		Log:         t.Log,
 		Upstream:    t.Upstream,
 		Token:       t.Token,
+		Upstreams:   t.Upstreams,
 		Platform:    t.Platform,
 		DialTimeout: t.DialTimeout,
 	}
-	return f.dialUpstream(account, target)
+	return f.dialUpstream(route, target)
 }
 
 // captureReader keeps the first limit bytes that pass through it while letting

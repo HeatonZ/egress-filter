@@ -82,6 +82,9 @@ type Route struct {
 	EgressIP string
 	// ProxyURL is the SOCKS5 endpoint for forward-proxy callers.
 	ProxyURL string
+	// Upstream names the Resin instance this lease belongs to, so an entry can
+	// dial the right instance with that instance's own password.
+	Upstream string
 }
 
 // Snapshot is a read-only copy of a route's health, safe to hand to callers.

@@ -1,8 +1,10 @@
 package entry
 
 import (
+	"bufio"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"io"
 	"net"
 	"net/http"
@@ -45,6 +47,9 @@ type testTerminator struct {
 	direct string
 }
 
+// testProxyToken is the aggregator's own password, the one clients present.
+const testProxyToken = "testtoken"
+
 func newTestTerminator(t *testing.T, p *pool.Pool, ev Evictor) *testTerminator {
 	t.Helper()
 	dir := t.TempDir()
@@ -57,6 +62,7 @@ func newTestTerminator(t *testing.T, p *pool.Pool, ev Evictor) *testTerminator {
 			Pool:    p,
 			Log:     quietLogger(),
 			CA:      ca,
+			Token:   testProxyToken,
 			Evictor: ev,
 		},
 	}
@@ -219,6 +225,11 @@ func TestTerminateEvictsAfterThreshold(t *testing.T) {
 // the upstream response, having trusted the test CA.
 func doThroughProxy(t *testing.T, proxyURL string, ca *mitm.CA, upstreamAddr, account, body string) *http.Response {
 	t.Helper()
+	return doThroughProxyAs(t, proxyURL, "opencode."+account, testProxyToken, ca, upstreamAddr, body)
+}
+
+func doThroughProxyLegacy(t *testing.T, proxyURL string, ca *mitm.CA, upstreamAddr, account, body string) *http.Response {
+	t.Helper()
 	roots := x509.NewCertPool()
 	if !roots.AppendCertsFromPEM(ca.CertPEM()) {
 		t.Fatal("test ca is not valid pem")
@@ -323,4 +334,209 @@ func mustURL(t *testing.T, raw string) *url.URL {
 		t.Fatalf("parse proxy url: %v", err)
 	}
 	return u
+}
+
+// doThroughProxyAs sends one request through proxyURL authenticating as user,
+// so the entry reads the lease from Proxy-Authorization the way a Resin client
+// already does.
+func doThroughProxyAs(t *testing.T, proxyURL, user, pass string, ca *mitm.CA, upstreamAddr, body string) *http.Response {
+	t.Helper()
+	u := mustURL(t, proxyURL)
+	u.User = url.UserPassword(user, pass)
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(ca.CertPEM()) {
+		t.Fatal("test ca is not valid pem")
+	}
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			Proxy:           http.ProxyURL(u),
+			TLSClientConfig: &tls.Config{RootCAs: roots},
+		},
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://"+upstreamAddr+"/v1/chat/completions",
+		strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Opencode-Session", "ses_test000000000000000000000")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request through proxy: %v", err)
+	}
+	return resp
+}
+
+// Resin callers already name the account in the proxy URL. The aggregator must
+// honour that too: one URL per lease is what keeps per-account stickiness,
+// which automatic selection would quietly destroy.
+func TestTerminatePinsLeaseFromProxyAuth(t *testing.T) {
+	up := upstreamServer(t, http.StatusOK, `{"ok":true}`, nil)
+	p := seeded()
+	tt := newTestTerminator(t, p, &recordingEvictor{})
+	addr := strings.TrimPrefix(up.URL, "https://")
+	var dialed string
+	tt.dial = func(account, target string) (net.Conn, error) {
+		dialed = account
+		return net.Dial("tcp", addr)
+	}
+	tt.UpstreamRoots = rootsFor(t, up)
+	proxy := httptest.NewServer(tt)
+	defer proxy.Close()
+
+	resp := doThroughProxyAs(t, proxy.URL, "opencode.leaseB", testProxyToken, tt.CA, upstreamHost(up), `{}`)
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	if dialed != "leaseB" {
+		t.Fatalf("dialed %q, want leaseB (the proxy user must pin the egress)", dialed)
+	}
+	waitFor(t, func() bool { return snapshotOf(p, "leaseB").ConsecOK > 0 })
+}
+
+// A pin that has been withdrawn must fail instead of borrowing a healthy lease.
+// Silent fallback is what would make a per-account pool unpredictable.
+func TestTerminatePinnedBlockedDoesNotFallBack(t *testing.T) {
+	up := upstreamServer(t, http.StatusOK, `{"ok":true}`, nil)
+	p := seeded()
+	for i := 0; i < 5; i++ {
+		p.Record("leaseB", pool.VerdictBlocked, 0, "test block")
+	}
+	if !p.Blocked("leaseB") {
+		t.Fatalf("leaseB state=%v, want blocked", snapshotOf(p, "leaseB").State)
+	}
+	tt := newTestTerminator(t, p, &recordingEvictor{})
+	addr := strings.TrimPrefix(up.URL, "https://")
+	var dialed []string
+	tt.dial = func(account, target string) (net.Conn, error) {
+		dialed = append(dialed, account)
+		return net.Dial("tcp", addr)
+	}
+	tt.UpstreamRoots = rootsFor(t, up)
+	proxy := httptest.NewServer(tt)
+	defer proxy.Close()
+
+	resp := doThroughProxyAs(t, proxy.URL, "opencode.leaseB", testProxyToken, tt.CA, upstreamHost(up), `{}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if len(dialed) != 0 {
+		t.Fatalf("dialed %v, want no dial at all", dialed)
+	}
+}
+
+// No credentials is refused, so the pool is not an open proxy inside ai-net.
+func TestTerminateRequiresCredentials(t *testing.T) {
+	up := upstreamServer(t, http.StatusOK, `{"ok":true}`, nil)
+	tt := newTestTerminator(t, seeded(), &recordingEvictor{})
+	tt.dial = directTo(t, up)
+	tt.UpstreamRoots = rootsFor(t, up)
+	proxy := httptest.NewServer(tt)
+	defer proxy.Close()
+
+	if line := rawConnect(t, proxy.URL, "", ""); !strings.Contains(line, "407") {
+		t.Fatalf("status line = %q, want 407", line)
+	}
+}
+
+// The aggregator has its own password. An upstream token must not authenticate
+// a client here, or sharing a Resin credential would open the aggregator.
+func TestTerminateRejectsUpstreamTokenAsClientPassword(t *testing.T) {
+	up := upstreamServer(t, http.StatusOK, `{"ok":true}`, nil)
+	p := seeded()
+	tt := newTestTerminator(t, p, &recordingEvictor{})
+	tt.dial = directTo(t, up)
+	tt.UpstreamRoots = rootsFor(t, up)
+	tt.Upstreams = Upstreams{
+		"main": {Name: "main", ProxyAddr: "resin:2260", Token: "resin-secret", BaseURL: "http://resin:2260"},
+	}
+	proxy := httptest.NewServer(tt)
+	defer proxy.Close()
+
+	if line := rawConnect(t, proxy.URL, "opencode.leaseA", "resin-secret"); !strings.Contains(line, "407") {
+		t.Fatalf("status line = %q, want 407: an upstream token is not a client password", line)
+	}
+	if line := rawConnect(t, proxy.URL, "opencode.leaseA", testProxyToken); !strings.Contains(line, "200") {
+		t.Fatalf("status line = %q, want 200 with the aggregator password", line)
+	}
+}
+
+// rawConnect sends a bare CONNECT and returns the proxy status line. The client
+// helper cannot be used: Go Transport turns a proxy 407 into an error.
+func rawConnect(t *testing.T, proxyURL, user, pass string) string {
+	t.Helper()
+	crlf := string([]byte{13, 10})
+	addr := strings.TrimPrefix(proxyURL, "http://")
+	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+
+	var b strings.Builder
+	b.WriteString("CONNECT example.com:443 HTTP/1.1" + crlf + "Host: example.com:443" + crlf)
+	if user != "" {
+		b.WriteString("Proxy-Authorization: Basic " + basicAuth(user, pass) + crlf)
+	}
+	b.WriteString(crlf)
+	if _, err := io.WriteString(c, b.String()); err != nil {
+		t.Fatalf("write connect: %v", err)
+	}
+	br := bufio.NewReader(c)
+	line, err := br.ReadString(byte(10))
+	if err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	return strings.TrimSpace(line)
+}
+
+func basicAuth(user, pass string) string {
+	return base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+}
+
+// Two instances can hold a lease of the same name. The client disambiguates
+// with "<upstream>/<platform>.<account>", and the request must land on that
+// instance rather than whichever route happens to come first.
+func TestTerminateUpstreamQualifierSelectsInstance(t *testing.T) {
+	up := upstreamServer(t, http.StatusOK, `{"ok":true}`, nil)
+	p := pool.New(pool.Options{FailThreshold: 5, RecoverThreshold: 1})
+	p.Sync([]pool.Route{
+		{Key: "a/lease1", Lease: "lease1", EgressIP: "1.1.1.1", Upstream: "a"},
+		{Key: "b/lease1", Lease: "lease1", EgressIP: "2.2.2.2", Upstream: "b"},
+	})
+
+	tt := newTestTerminator(t, p, &recordingEvictor{})
+	addr := strings.TrimPrefix(up.URL, "https://")
+	tt.dial = func(account, target string) (net.Conn, error) {
+		return net.Dial("tcp", addr)
+	}
+	tt.UpstreamRoots = rootsFor(t, up)
+	proxy := httptest.NewServer(tt)
+	defer proxy.Close()
+
+	resp := doThroughProxyAs(t, proxy.URL, "b/opencode.lease1", testProxyToken, tt.CA, upstreamHost(up), `{}`)
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	waitFor(t, func() bool { return snapshotByKey(p, "b/lease1").ConsecOK > 0 })
+	if got := snapshotByKey(p, "a/lease1").ConsecOK; got != 0 {
+		t.Fatalf("instance a recorded %d successes, want 0", got)
+	}
+}
+
+// snapshotByKey is the lookup multi-instance tests need: two routes can share a
+// lease name, so matching on Lease alone is ambiguous.
+func snapshotByKey(p *pool.Pool, key string) pool.Snapshot {
+	for _, s := range p.Snapshots() {
+		if s.Key == key {
+			return s
+		}
+	}
+	return pool.Snapshot{}
 }

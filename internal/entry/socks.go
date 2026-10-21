@@ -35,6 +35,12 @@ type Forward struct {
 	Upstream string
 	// Token is appended as the SOCKS5 password.
 	Token string
+	// Password is this entry's own password. When set, clients must present it;
+	// it is separate from the per-instance Resin tokens in Upstreams.
+	Password string
+	// Upstreams maps a route's upstream name to that instance's endpoint and
+	// token, so several Resin deployments can sit behind one entry.
+	Upstreams Upstreams
 	// Platform prefixes the account: the upstream user is "platform.account".
 	Platform string
 	// DialTimeout bounds the hop to the upstream proxy.
@@ -118,9 +124,13 @@ func (f *Forward) handleSOCKS5(c net.Conn, br *bufio.Reader) {
 		if _, err := io.ReadFull(br, passwd); err != nil {
 			return
 		}
-		preferred = normalisePreferred(string(uname))
-		// Any password is accepted: the value that matters is the username.
-		// Rejecting here would make a typo look like a network failure.
+		preferred = string(uname)
+		if !f.authorized(string(passwd)) {
+			// RFC 1929 auth failure: the client learns the credential is wrong
+			// instead of seeing an unexplained connect failure.
+			_, _ = c.Write([]byte{0x01, 0x01})
+			return
+		}
 		if _, err := c.Write([]byte{0x01, 0x00}); err != nil {
 			return
 		}
@@ -189,8 +199,14 @@ func (f *Forward) handleHTTP(c net.Conn, br *bufio.Reader) {
 	}
 	preferred := ""
 	if u, p, ok := parseProxyAuth(req.Header.Get("Proxy-Authorization")); ok {
-		_ = p
-		preferred = normalisePreferred(u)
+		if !f.authorized(p) {
+			writeProxyAuthRequired(c)
+			return
+		}
+		preferred = u
+	} else if f.Password != "" {
+		writeProxyAuthRequired(c)
+		return
 	}
 
 	if req.Method != http.MethodConnect {
@@ -219,7 +235,7 @@ func (f *Forward) tunnel(c net.Conn, br *bufio.Reader, target, preferred string,
 		return
 	}
 
-	upstream, err := f.dialUpstream(account, target)
+	upstream, err := f.dialUpstream(route, target)
 	if err != nil {
 		f.Log.Warn("forward dial", "route", account, "target", target, "error", err)
 		f.Pool.Record(route.Key, pool.VerdictUnknown, 0, "forward dial: "+err.Error())
@@ -261,33 +277,47 @@ func (f *Forward) tunnel(c net.Conn, br *bufio.Reader, target, preferred string,
 }
 
 func (f *Forward) choose(preferred string) (pool.Route, string) {
-	if preferred != "" && preferred != "auto" {
+	upstream, lease := splitPreferred(preferred)
+	if lease != "" && lease != "auto" {
 		for _, s := range f.Pool.Snapshots() {
-			if s.Lease == preferred && s.State != pool.StateBlocked {
-				return s.Route, preferred
+			if s.Lease != lease || s.State == pool.StateBlocked {
+				continue
 			}
+			if upstream != "" && s.Upstream != upstream {
+				continue
+			}
+			return s.Route, s.Key
 		}
 	}
 	route, ok := f.Pool.Pick()
 	if !ok {
 		return pool.Route{}, ""
 	}
-	return route, route.Lease
+	return route, route.Key
 }
 
 // dialUpstream performs a SOCKS5 CONNECT to Resin, which then binds a lease.
-func (f *Forward) dialUpstream(account, target string) (net.Conn, error) {
+func (f *Forward) dialUpstream(route pool.Route, target string) (net.Conn, error) {
 	timeout := f.DialTimeout
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	conn, err := net.DialTimeout("tcp", f.Upstream, timeout)
+	backend, token := f.Upstream, f.Token
+	if up, ok := f.Upstreams.Resolve(route.Upstream); ok {
+		if up.ProxyAddr != "" {
+			backend = up.ProxyAddr
+		}
+		if up.Token != "" {
+			token = up.Token
+		}
+	}
+	conn, err := net.DialTimeout("tcp", backend, timeout)
 	if err != nil {
 		return nil, err
 	}
 	conn.SetDeadline(time.Now().Add(timeout))
 
-	user := f.Platform + "." + account
+	user := f.Platform + "." + route.Lease
 	// Offer no-auth and user/pass so the upstream can pick; Resin requires
 	// credentials, but offering both avoids a second round trip on the happy
 	// path.
@@ -310,8 +340,8 @@ func (f *Forward) dialUpstream(account, target string) (net.Conn, error) {
 	case 0x02:
 		auth := []byte{0x01, byte(len(user))}
 		auth = append(auth, user...)
-		auth = append(auth, byte(len(f.Token)))
-		auth = append(auth, f.Token...)
+		auth = append(auth, byte(len(token)))
+		auth = append(auth, token...)
 		if _, err := conn.Write(auth); err != nil {
 			conn.Close()
 			return nil, err
@@ -418,3 +448,19 @@ func parseProxyAuth(h string) (user, pass string, ok bool) {
 }
 
 var _ = context.Background
+
+// authorized reports whether pass is this entry's own password. An empty
+// configured password leaves the entry open, which is only useful for tests.
+func (f *Forward) authorized(pass string) bool {
+	return f.Password == "" || pass == f.Password
+}
+
+// writeProxyAuthRequired answers a CONNECT with 407. Line endings are assembled
+// from byte values so they cannot be mangled by an editor.
+func writeProxyAuthRequired(c net.Conn) {
+	crlf := string([]byte{13, 10})
+	quote := string([]byte{34})
+	_, _ = io.WriteString(c, "HTTP/1.1 407 Proxy Authentication Required"+crlf+
+		"Proxy-Authenticate: Basic realm="+quote+"egress-filter"+quote+crlf+
+		"Content-Length: 0"+crlf+crlf)
+}
