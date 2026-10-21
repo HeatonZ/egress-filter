@@ -46,6 +46,7 @@ func main() {
 	p := pool.New(pool.Options{
 		FailThreshold:    cfg.FailThreshold,
 		RecoverThreshold: cfg.RecoverThreshold,
+		LazyTTL:          cfg.LazyTTL,
 	})
 	// One registry is shared by every entry: a route carries the name of the
 	// Resin instance that owns its lease, and the entry dials that instance with
@@ -236,6 +237,8 @@ type config struct {
 	RecoverThreshold  int
 	Evict             bool
 	EvictCooldown     time.Duration
+	// LazyTTL expires a route a client named that discovery never lists.
+	LazyTTL time.Duration
 }
 
 // upstreamConfig describes one Resin instance. It is the JSON shape accepted by
@@ -270,6 +273,7 @@ func loadConfig() config {
 		RecoverThreshold:  integer("EF_RECOVER_THRESHOLD", 2),
 		Evict:             boolean("EF_EVICT", false),
 		EvictCooldown:     duration("EF_EVICT_COOLDOWN", 10*time.Minute),
+		LazyTTL:           duration("EF_LAZY_TTL", 10*time.Minute),
 	}
 	// The aggregator password defaults to the old single-instance token so an
 	// existing deployment keeps working without a new variable.

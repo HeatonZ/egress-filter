@@ -1,6 +1,9 @@
 package pool
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // A lease a client names exists as far as Resin is concerned: Resin creates it
 // on first use. Discovery must not be able to delete it out from under a caller
@@ -77,4 +80,40 @@ func snapshotKey(p *Pool, key string) Snapshot {
 		}
 	}
 	return Snapshot{}
+}
+
+// A client-named route that discovery never adopts must expire, or a single
+// mistyped lease would sit in the pool and in /status forever.
+func TestEnsureExpiresAfterIdle(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	p := New(Options{LazyTTL: 10 * time.Minute, Now: func() time.Time { return now }})
+
+	p.Ensure(Route{Key: "typo", Lease: "typo"})
+	now = now.Add(9 * time.Minute)
+	p.Sync(nil)
+	if len(p.Snapshots()) != 1 {
+		t.Fatal("route expired before its TTL")
+	}
+
+	now = now.Add(2 * time.Minute)
+	p.Sync(nil)
+	if len(p.Snapshots()) != 0 {
+		t.Fatalf("idle client-named route survived its TTL: %+v", p.Snapshots())
+	}
+}
+
+// Being named again refreshes the idle clock: a lease in active use must not
+// expire just because discovery has not listed it yet.
+func TestEnsureRefreshesIdleClock(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	p := New(Options{LazyTTL: 10 * time.Minute, Now: func() time.Time { return now }})
+
+	p.Ensure(Route{Key: "busy", Lease: "busy"})
+	now = now.Add(9 * time.Minute)
+	p.Ensure(Route{Key: "busy", Lease: "busy"})
+	now = now.Add(9 * time.Minute)
+	p.Sync(nil)
+	if len(p.Snapshots()) != 1 {
+		t.Fatal("a route still in use expired")
+	}
 }

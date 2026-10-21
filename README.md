@@ -47,8 +47,10 @@ evicting.
 Consequences worth knowing:
 
 - A route a caller names stays in the pool across discovery refreshes, keeping
-  its failure streak, until discovery adopts it. Once adopted it behaves like any
-  discovered route and disappears when the lease does.
+  its failure streak, until discovery adopts it. If discovery never lists it, it
+  expires after `EF_LAZY_TTL` idle so a mistyped name cannot sit in `/status`
+  forever. Once adopted it behaves like any discovered route and disappears when
+  the lease does.
 - A lease that live traffic has already proved blocked is refused rather than
   forwarded. That is positive evidence, not absence of evidence, so it outranks
   the caller's wish.
@@ -124,6 +126,7 @@ Eviction is **off by default**. Run a while with `EF_EVICT=false` and read
 | `EF_FAIL_THRESHOLD` | `5` | consecutive blocked responses before withdrawal |
 | `EF_EVICT` | `false` | delete leases of blocked routes |
 | `EF_EVICT_COOLDOWN` | `10m` | minimum gap between deletions of one account |
+| `EF_LAZY_TTL` | `10m` | how long a client-named lease discovery never lists stays in the pool |
 
 ## Several Resin instances
 

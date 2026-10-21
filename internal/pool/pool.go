@@ -113,6 +113,10 @@ type Options struct {
 	// ProbeInterval is how often each route is probed. Only used by active
 	// probing; passive mode leaves it unused.
 	ProbeInterval time.Duration
+	// LazyTTL is how long a route a client named keeps existing after its last
+	// use, while discovery still does not list it. Without an expiry a one-off
+	// typo would stay in the pool and in /status forever.
+	LazyTTL time.Duration
 	// Now is injectable for tests.
 	Now func() time.Time
 }
@@ -126,6 +130,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.ProbeInterval <= 0 {
 		o.ProbeInterval = 60 * time.Second
+	}
+	if o.LazyTTL <= 0 {
+		o.LazyTTL = 10 * time.Minute
 	}
 	if o.Now == nil {
 		o.Now = time.Now
@@ -153,6 +160,9 @@ type entry struct {
 	// creates a lease on first use, so such a route is real even though the
 	// last discovery pass did not know it yet.
 	lazy bool
+	// lastUsed is when a client last named this route, used to expire one that
+	// discovery never adopts.
+	lastUsed time.Time
 }
 
 // Pool is the shared route registry.
@@ -189,9 +199,10 @@ func (p *Pool) Ensure(r Route) Route {
 	defer p.mu.Unlock()
 
 	if e, ok := p.entries[r.Key]; ok {
+		e.lastUsed = p.opts.Now()
 		return e.route
 	}
-	e := &entry{route: r, state: StateReady, lazy: true}
+	e := &entry{route: r, state: StateReady, lazy: true, lastUsed: p.opts.Now()}
 	p.entries[r.Key] = e
 	p.order = append(p.order, r.Key)
 	return r
@@ -238,7 +249,8 @@ func (p *Pool) Sync(routes []Route) {
 		if _, ok := seen[key]; ok {
 			continue
 		}
-		if e, ok := p.entries[key]; ok && e.lazy {
+		if e, ok := p.entries[key]; ok && e.lazy &&
+			p.opts.Now().Sub(e.lastUsed) < p.opts.LazyTTL {
 			order = append(order, key)
 		}
 	}
@@ -247,8 +259,9 @@ func (p *Pool) Sync(routes []Route) {
 			continue
 		}
 		// Routes that were adopted by discovery and now vanished are genuinely
-		// gone; lazy ones only exist because a client keeps naming them.
-		if e.lazy {
+		// gone. A lazy one only exists because a client named it, so it expires
+		// once nobody has asked for it for a while.
+		if e.lazy && p.opts.Now().Sub(e.lastUsed) < p.opts.LazyTTL {
 			continue
 		}
 		delete(p.entries, key)
