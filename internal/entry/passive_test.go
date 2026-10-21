@@ -185,13 +185,13 @@ func TestPassiveSuccessClearsFailures(t *testing.T) {
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
-	for _, s := range p.Snapshots() {
-		if s.Key == "leaseA" {
-			if s.State != pool.StateReady || s.ConsecFail != 0 {
-				t.Fatalf("success did not clear failures: state=%v fail=%d", s.State, s.ConsecFail)
-			}
-		}
-	}
+	// The verdict is recorded after the response is flushed, so waiting on the
+	// condition is the only stable assertion: reading straight after the body
+	// closes races the writer and fails intermittently on a slower machine.
+	waitFor(t, func() bool {
+		s := snapshotFor(p, "leaseA")
+		return s.State == pool.StateReady && s.ConsecFail == 0
+	})
 }
 
 // 400 means the egress carried the request and the upstream rejected its
