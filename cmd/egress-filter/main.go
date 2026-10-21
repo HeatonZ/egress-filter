@@ -133,34 +133,38 @@ func main() {
 	// CA, which is a deployment decision rather than a default.
 	var termLn net.Listener
 	if cfg.TerminateAddr != "" {
-		ca, err := mitm.LoadOrCreate(cfg.CAFile)
-		if err != nil {
-			log.Error("load ca", "dir", cfg.CAFile, "error", err)
-			os.Exit(1)
-		}
-		term := &entry.Terminator{
-			Pool:        p,
-			Log:         log,
-			CA:          ca,
-			Upstream:    cfg.ProxyAddr,
-			Token:       cfg.ProxyToken,
-			Platform:    cfg.Platform,
-			DialTimeout: 15 * time.Second,
-			Evictor:     sched,
-		}
-		termLn, err = net.Listen("tcp", cfg.TerminateAddr)
-		if err != nil {
-			log.Error("terminate listen", "addr", cfg.TerminateAddr, "error", err)
-			os.Exit(1)
-		}
-		termSrv := &http.Server{Handler: term, ReadHeaderTimeout: 30 * time.Second}
-		go func() {
-			log.Info("terminating forward proxy listening", "addr", cfg.TerminateAddr,
-				"ca_cert", cfg.CAFile+"/ca.crt")
-			if err := termSrv.Serve(termLn); err != nil && err != http.ErrServerClosed {
-				log.Error("terminate server", "error", err)
+		if ca, err := mitm.LoadOrCreate(cfg.CAFile); err != nil {
+			// The terminating entry is optional and the other two are not. A
+			// bad CA directory (wrong owner, read-only volume) must not take the
+			// reverse and SOCKS5 entries down with it.
+			log.Error("load ca, terminating entry disabled",
+				"dir", cfg.CAFile, "error", err,
+				"hint", "the container user must own this directory")
+		} else if ln, err := net.Listen("tcp", cfg.TerminateAddr); err != nil {
+			// Same reasoning: a busy port must not stop the other entries.
+			log.Error("terminate listen, entry disabled",
+				"addr", cfg.TerminateAddr, "error", err)
+		} else {
+			termLn = ln
+			term := &entry.Terminator{
+				Pool:        p,
+				Log:         log,
+				CA:          ca,
+				Upstream:    cfg.ProxyAddr,
+				Token:       cfg.ProxyToken,
+				Platform:    cfg.Platform,
+				DialTimeout: 15 * time.Second,
+				Evictor:     sched,
 			}
-		}()
+			termSrv := &http.Server{Handler: term, ReadHeaderTimeout: 30 * time.Second}
+			go func() {
+				log.Info("terminating forward proxy listening", "addr", cfg.TerminateAddr,
+					"ca_cert", cfg.CAFile+"/ca.crt")
+				if err := termSrv.Serve(termLn); err != nil && err != http.ErrServerClosed {
+					log.Error("terminate server", "error", err)
+				}
+			}()
+		}
 	}
 
 	go sched.Run(ctx)
