@@ -544,3 +544,49 @@ func snapshotByKey(p *pool.Pool, key string) pool.Snapshot {
 	}
 	return pool.Snapshot{}
 }
+
+// A client that never offers the user/pass method must be refused, not silently
+// let through: RFC 1928 lets the client pick the method, so the server has to
+// reject instead of falling back to no-auth.
+func TestForwardRequiresUserPassMethod(t *testing.T) {
+	f := &Forward{Password: testProxyToken, Platform: "opencode", Log: quietLogger()}
+	client, server := net.Pipe()
+	defer client.Close()
+
+	go f.handle(server)
+
+	// Offer only no-auth.
+	if _, err := client.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, 2)
+	client.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(client, reply); err != nil {
+		t.Fatalf("read method reply: %v", err)
+	}
+	if reply[0] != 0x05 || reply[1] != 0xff {
+		t.Fatalf("method reply = %v, want 05 ff (no acceptable methods)", reply)
+	}
+}
+
+// Without a configured password the entry stays open, which is what the local
+// harness and a trusted-network deployment rely on.
+func TestForwardAllowsNoAuthWhenNoPassword(t *testing.T) {
+	f := &Forward{Platform: "opencode", Log: quietLogger()}
+	client, server := net.Pipe()
+	defer client.Close()
+
+	go f.handle(server)
+
+	if _, err := client.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, 2)
+	client.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(client, reply); err != nil {
+		t.Fatalf("read method reply: %v", err)
+	}
+	if reply[1] != 0x00 {
+		t.Fatalf("method reply = %v, want no-auth accepted", reply)
+	}
+}

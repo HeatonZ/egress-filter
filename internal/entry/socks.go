@@ -101,6 +101,14 @@ func (f *Forward) handleSOCKS5(c net.Conn, br *bufio.Reader) {
 	if wantUserPass {
 		method = 0x02
 	}
+	if f.Password != "" && !wantUserPass {
+		// A configured password means credentials are mandatory. Offering
+		// no-auth to a client that never mentions it would let anyone who omits
+		// the method skip authentication entirely: RFC 1928 lets the client
+		// choose, so the server has to refuse rather than fall back.
+		_, _ = c.Write([]byte{0x05, 0xff})
+		return
+	}
 	if _, err := c.Write([]byte{0x05, method}); err != nil {
 		return
 	}

@@ -32,9 +32,13 @@ carry an account, so it travels in the proxy credentials: the SOCKS5 username
 (or `Proxy-Authorization` user) is the preferred account.
 
 ```
-socks5h://opencode.freeproxy30:any@egress-filter:1080
-http://opencode.auto:any@egress-filter:1080
+socks5h://opencode.freeproxy30:<EF_PROXY_PASSWORD>@egress-filter:1080
+http://opencode.auto:<EF_PROXY_PASSWORD>@egress-filter:1080
 ```
+
+The password is this entry's own (`EF_PROXY_PASSWORD`), not a Resin token, and it
+is mandatory: a SOCKS5 client that offers only no-auth is refused rather than
+quietly let through.
 
 ## The caller decides the lease
 
