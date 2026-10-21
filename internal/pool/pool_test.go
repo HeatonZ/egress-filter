@@ -250,9 +250,10 @@ func TestClaimEvictionGuards(t *testing.T) {
 	}
 }
 
-// Only positive evidence of a blocked egress may trigger deletion. An
-// unreachable route is a transient network problem, not a reason to churn.
-func TestClaimEvictionRequiresBlockedVerdict(t *testing.T) {
+// A withdrawn route is evictable whatever the failure was: five dial timeouts
+// withdraw it just like five blocked responses, and only a fresh lease brings
+// it back.
+func TestClaimEvictionAcceptsAnyBlockedRoute(t *testing.T) {
 	p := testPool()
 	seed(p, "a")
 	for i := 0; i < defaultThreshold; i++ {
@@ -261,8 +262,11 @@ func TestClaimEvictionRequiresBlockedVerdict(t *testing.T) {
 	if p.Snapshots()[0].State != StateBlocked {
 		t.Fatal("precondition: repeated unknown failures should block")
 	}
+	if !p.ClaimEviction("a", time.Minute) {
+		t.Fatal("a blocked route must be evictable")
+	}
 	if p.ClaimEviction("a", time.Minute) {
-		t.Fatal("an unreachable route must not be evicted; only a blocked egress may")
+		t.Fatal("the cooldown did not stop a second deletion in the same window")
 	}
 }
 

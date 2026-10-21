@@ -343,9 +343,11 @@ func (p *Pool) Blocked(key string) bool {
 
 // ClaimEviction reserves the right to delete this route's lease.
 //
-// It returns true only when the route is condemned by positive evidence of a
-// blocked egress, and it has not been evicted within cooldown. Reserving before
-// the delete keeps concurrent requests from all firing the same eviction.
+// Any withdrawn route is evictable, whatever produced the failures: a route
+// that reached the threshold is not serving, and the only way back is a fresh
+// lease. The cooldown stops the same account being deleted repeatedly inside
+// one window. Reserving before the delete keeps concurrent requests from all
+// firing the same eviction.
 func (p *Pool) ClaimEviction(key string, cooldown time.Duration) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -354,7 +356,7 @@ func (p *Pool) ClaimEviction(key string, cooldown time.Duration) bool {
 	if !ok {
 		return false
 	}
-	if e.state != StateBlocked || e.lastVerdict != VerdictBlocked {
+	if e.state != StateBlocked {
 		return false
 	}
 	now := p.opts.Now()
