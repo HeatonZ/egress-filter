@@ -100,9 +100,9 @@ type Snapshot struct {
 
 // Options tunes the state machine.
 type Options struct {
-	// FailThreshold is how many consecutive failures demote a route to blocked.
-	// One is too twitchy for a free tier that answers 500 under load; two is
-	// the value Resin itself uses.
+	// FailThreshold is how many consecutive failures withdraw a route. Any
+	// success resets the streak: a route that still serves traffic is not
+	// blocked, however many failures it had before.
 	FailThreshold int
 	// RecoverThreshold is how many consecutive successes return a blocked
 	// route to ready.
@@ -116,7 +116,7 @@ type Options struct {
 
 func (o Options) withDefaults() Options {
 	if o.FailThreshold <= 0 {
-		o.FailThreshold = 2
+		o.FailThreshold = 5
 	}
 	if o.RecoverThreshold <= 0 {
 		o.RecoverThreshold = 2
@@ -231,8 +231,8 @@ func (p *Pool) Record(key string, v Verdict, latency time.Duration, detail strin
 		e.consecFail = 0
 		e.lastOKAt = now
 		e.lastError = ""
-		// A route must earn its way back: one lucky request after a block is
-		// not evidence the block lifted.
+		// A success ends the failure streak. Only a route that keeps failing
+		// without ever serving is withdrawn.
 		if e.state == StateBlocked && e.consecOK >= p.opts.RecoverThreshold {
 			e.state = StateReady
 		} else if e.state == StateSuspect && e.consecOK >= 1 {
@@ -261,6 +261,14 @@ func (p *Pool) Record(key string, v Verdict, latency time.Duration, detail strin
 		// The egress was never exercised: the upstream rejected the request
 		// shape before routing it. Reset nothing and condemn nothing.
 	}
+}
+
+// Blocked reports whether the route has been withdrawn from selection.
+func (p *Pool) Blocked(key string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.entries[key]
+	return ok && e.state == StateBlocked
 }
 
 // ClaimEviction reserves the right to delete this route's lease.

@@ -64,7 +64,7 @@ func TestPassiveDetectsBlockedEgress(t *testing.T) {
 	srv := httptest.NewServer(r)
 	defer srv.Close()
 
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 5; i++ {
 		resp, err := http.Get(srv.URL + "/tok/opencode.leaseA/https/opencode.ai/inference/v1/chat/completions")
 		if err != nil {
 			t.Fatal(err)
@@ -83,7 +83,7 @@ func TestPassiveDetectsBlockedEgress(t *testing.T) {
 		}
 	}
 	if snap.State != pool.StateBlocked {
-		t.Fatalf("state = %v, want blocked after two gzipped blocked responses", snap.State)
+		t.Fatalf("state = %v, want blocked after five gzipped blocked responses", snap.State)
 	}
 	if snap.LastVerdict != pool.VerdictBlocked {
 		t.Fatalf("verdict = %v, want blocked", snap.LastVerdict)

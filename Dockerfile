@@ -16,7 +16,11 @@ RUN apk add --no-cache ca-certificates wget && adduser -D -u 10001 app
 COPY --from=build /out/egress-filter /usr/local/bin/egress-filter
 
 USER app
-EXPOSE 8080 1080 9090
+# 8080 reverse, 1080 forward, 9090 status, 1081 TLS-terminating forward.
+EXPOSE 8080 1080 9090 1081
+# The signing CA lives here. It must be a volume: regenerating it would
+# invalidate every client that trusts the old one.
+VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD wget -qO- http://127.0.0.1:9090/healthz || exit 1

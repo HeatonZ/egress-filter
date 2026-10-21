@@ -5,8 +5,21 @@ import (
 	"time"
 )
 
+// testPool uses the production defaults so the tests exercise the behaviour
+// that actually ships rather than a hand-picked threshold.
 func testPool() *Pool {
-	return New(Options{FailThreshold: 2, RecoverThreshold: 2})
+	return New(Options{})
+}
+
+// defaultThreshold is the shipped default; tests assert against it instead of a
+// literal so changing the default cannot silently invalidate them.
+const defaultThreshold = 5
+
+// failN records n blocked verdicts on key.
+func failN(p *Pool, key string, n int) {
+	for i := 0; i < n; i++ {
+		p.Record(key, VerdictBlocked, time.Millisecond, "blocked")
+	}
 }
 
 func seed(p *Pool, keys ...string) {
@@ -21,17 +34,43 @@ func TestBlockedAfterThreshold(t *testing.T) {
 	p := testPool()
 	seed(p, "a")
 
-	// One failure is not enough: a free tier answers a stray 403 under load.
-	p.Record("a", VerdictBlocked, time.Millisecond, "blocked")
-	if got := p.Snapshots()[0].State; got != StateSuspect {
-		t.Fatalf("after one failure state = %v, want suspect", got)
+	// Four failures are not enough: the threshold is five consecutive.
+	for i := 1; i <= 4; i++ {
+		p.Record("a", VerdictBlocked, time.Millisecond, "blocked")
+		if got := p.Snapshots()[0].State; got != StateSuspect {
+			t.Fatalf("after %d failures state = %v, want suspect", i, got)
+		}
 	}
 	p.Record("a", VerdictBlocked, time.Millisecond, "blocked")
 	if got := p.Snapshots()[0].State; got != StateBlocked {
-		t.Fatalf("after two failures state = %v, want blocked", got)
+		t.Fatalf("after five failures state = %v, want blocked", got)
 	}
 	if _, ok := p.Pick(); ok {
 		t.Fatal("a blocked route must not be picked")
+	}
+}
+
+// A single success must reset the streak: a route that still serves traffic is
+// not blocked, however many failures preceded it.
+func TestSuccessResetsFailureStreak(t *testing.T) {
+	p := testPool()
+	seed(p, "a")
+
+	for i := 0; i < 4; i++ {
+		p.Record("a", VerdictBlocked, time.Millisecond, "blocked")
+	}
+	p.Record("a", VerdictOK, time.Millisecond, "ok")
+	if got := p.Snapshots()[0].ConsecFail; got != 0 {
+		t.Fatalf("consecutive failures after a success = %d, want 0", got)
+	}
+
+	// Four more failures still must not withdraw it, because the streak
+	// restarted.
+	for i := 0; i < 4; i++ {
+		p.Record("a", VerdictBlocked, time.Millisecond, "blocked")
+	}
+	if got := p.Snapshots()[0].State; got == StateBlocked {
+		t.Fatal("route withdrawn after a success restarted the streak")
 	}
 }
 
@@ -56,8 +95,7 @@ func TestBadRequestIsNotEvidence(t *testing.T) {
 func TestRecoveryRequiresEvidence(t *testing.T) {
 	p := testPool()
 	seed(p, "a")
-	p.Record("a", VerdictBlocked, time.Millisecond, "")
-	p.Record("a", VerdictBlocked, time.Millisecond, "")
+	failN(p, "a", defaultThreshold)
 	if p.Snapshots()[0].State != StateBlocked {
 		t.Fatal("precondition: route should be blocked")
 	}
@@ -78,8 +116,7 @@ func TestRecoveryRequiresEvidence(t *testing.T) {
 func TestDisappearedRouteIsForgotten(t *testing.T) {
 	p := testPool()
 	seed(p, "a", "b")
-	p.Record("a", VerdictBlocked, time.Millisecond, "")
-	p.Record("a", VerdictBlocked, time.Millisecond, "")
+	failN(p, "a", defaultThreshold)
 
 	seed(p, "b")
 	if n := len(p.Snapshots()); n != 1 {
@@ -136,8 +173,7 @@ func TestSuspectStaysSelectable(t *testing.T) {
 func TestBlockedIsWithheldThenRecovers(t *testing.T) {
 	p := testPool()
 	seed(p, "a")
-	p.Record("a", VerdictBlocked, time.Millisecond, "")
-	p.Record("a", VerdictBlocked, time.Millisecond, "")
+	failN(p, "a", defaultThreshold)
 	if _, ok := p.Pick(); ok {
 		t.Fatal("a blocked route must not be selected")
 	}
@@ -157,8 +193,7 @@ func TestCounts(t *testing.T) {
 	seed(p, "a", "b", "c")
 	// Routes start ready: with no active probe there is nothing to establish
 	// health, so a discovered route is usable until traffic says otherwise.
-	p.Record("b", VerdictBlocked, time.Millisecond, "")
-	p.Record("b", VerdictBlocked, time.Millisecond, "")
+	failN(p, "b", defaultThreshold)
 
 	c := p.Counts()
 	if c["total"] != 3 || c["blocked"] != 1 || c["suspect"] != 0 || c["ready"] != 2 {
@@ -172,8 +207,7 @@ func TestCounts(t *testing.T) {
 func TestResetClearsVerdict(t *testing.T) {
 	p := testPool()
 	seed(p, "a")
-	p.Record("a", VerdictBlocked, time.Millisecond, "")
-	p.Record("a", VerdictBlocked, time.Millisecond, "")
+	failN(p, "a", defaultThreshold)
 	if p.Snapshots()[0].State != StateBlocked {
 		t.Fatal("precondition: route should be blocked")
 	}
@@ -197,8 +231,7 @@ func TestClaimEvictionGuards(t *testing.T) {
 		t.Fatal("must not claim eviction for a healthy route")
 	}
 
-	p.Record("a", VerdictBlocked, time.Millisecond, "")
-	p.Record("a", VerdictBlocked, time.Millisecond, "")
+	failN(p, "a", defaultThreshold)
 	if !p.ClaimEviction("a", time.Minute) {
 		t.Fatal("should claim eviction for a blocked route")
 	}
@@ -220,8 +253,9 @@ func TestClaimEvictionGuards(t *testing.T) {
 func TestClaimEvictionRequiresBlockedVerdict(t *testing.T) {
 	p := testPool()
 	seed(p, "a")
-	p.Record("a", VerdictUnknown, time.Millisecond, "dial timeout")
-	p.Record("a", VerdictUnknown, time.Millisecond, "dial timeout")
+	for i := 0; i < defaultThreshold; i++ {
+		p.Record("a", VerdictUnknown, time.Millisecond, "dial timeout")
+	}
 	if p.Snapshots()[0].State != StateBlocked {
 		t.Fatal("precondition: repeated unknown failures should block")
 	}

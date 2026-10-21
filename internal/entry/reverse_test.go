@@ -17,8 +17,16 @@ func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
+// block drives a route to StateBlocked using the shipped threshold, so tests
+// do not silently depend on a threshold that changed.
+func block(p *pool.Pool, key string) {
+	for i := 0; i < 5; i++ {
+		p.Record(key, pool.VerdictBlocked, time.Millisecond, "")
+	}
+}
+
 func seeded() *pool.Pool {
-	p := pool.New(pool.Options{FailThreshold: 2, RecoverThreshold: 2})
+	p := pool.New(pool.Options{})
 	p.Sync([]pool.Route{
 		{Key: "leaseA", Lease: "leaseA", EgressIP: "1.1.1.1"},
 		{Key: "leaseB", Lease: "leaseB", EgressIP: "2.2.2.2"},
@@ -104,9 +112,7 @@ func TestReverseFailsOverFromBlockedAccount(t *testing.T) {
 	defer fake.Close()
 
 	p := seeded()
-	for i := 0; i < 2; i++ {
-		p.Record("leaseA", pool.VerdictBlocked, time.Millisecond, "")
-	}
+	block(p, "leaseA")
 
 	r := NewReverse(p, fake.URL, "opencode", quietLogger())
 	srv := httptest.NewServer(r)
@@ -129,9 +135,7 @@ func TestReverseFailsOverFromBlockedAccount(t *testing.T) {
 func TestReverseReportsExhaustedPool(t *testing.T) {
 	p := seeded()
 	for _, k := range []string{"leaseA", "leaseB"} {
-		for i := 0; i < 2; i++ {
-			p.Record(k, pool.VerdictBlocked, time.Millisecond, "")
-		}
+		block(p, k)
 	}
 	r := NewReverse(p, "http://127.0.0.1:1", "opencode", quietLogger())
 	srv := httptest.NewServer(r)

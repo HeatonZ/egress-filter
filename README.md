@@ -53,6 +53,27 @@ means the request shape is wrong, and `context_length_exceeded` (a 400) means th
 conversation is too long. Neither says anything about the egress, and treating
 either as a failure drains the pool for nothing.
 
+## The forward entry cannot see status codes
+
+A SOCKS5 CONNECT only carries bytes. The client speaks TLS end to end, so the
+proxy never learns whether the upstream answered 200 or 403 — which is the one
+signal this service exists to act on. Counting only connection-level failures
+misses every "connected fine, then got blocked" case, and that is the common
+one.
+
+`EF_LISTEN_TERMINATE` turns on a second forward entry that terminates TLS: it
+presents a certificate for the upstream host signed by its own CA, reads the
+request in the clear, then opens its own TLS connection upstream (verifying the
+real certificate, never downgrading). Status codes and error bodies become
+visible, and the same three-way classification as the reverse entry applies.
+
+The cost is trust. Every client using this port must trust `EF_CA_DIR/ca.crt`.
+The CA is generated once and persisted; regenerating it breaks every client, so
+the directory must be a volume.
+
+Pin an egress per request with `X-Egress-Route: <account>`; without it the pool
+picks one.
+
 ## Withdrawal
 
 After `EF_FAIL_THRESHOLD` consecutive blocked responses the route is withheld,
@@ -75,8 +96,10 @@ Eviction is **off by default**. Run a while with `EF_EVICT=false` and read
 | `EF_LISTEN_REVERSE` | `:8080` | reverse entry |
 | `EF_LISTEN_FORWARD` | `:1080` | forward entry |
 | `EF_LISTEN_STATUS` | `:9090` | `/healthz`, `/status` |
+| `EF_LISTEN_TERMINATE` | *(off)* | TLS-terminating forward entry; empty disables it |
+| `EF_CA_DIR` | `/data/ca` | where the signing CA is stored; must persist |
 | `EF_DISCOVERY_INTERVAL` | `60s` | lease refresh |
-| `EF_FAIL_THRESHOLD` | `2` | blocked responses before withdrawal |
+| `EF_FAIL_THRESHOLD` | `5` | consecutive blocked responses before withdrawal |
 | `EF_EVICT` | `false` | delete leases of blocked routes |
 | `EF_EVICT_COOLDOWN` | `10m` | minimum gap between deletions of one account |
 

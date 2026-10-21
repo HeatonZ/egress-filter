@@ -285,9 +285,7 @@ func TestForwardFailsWhenPoolEmpty(t *testing.T) {
 	resin := newFakeResin(t)
 	p := seeded()
 	for _, k := range []string{"leaseA", "leaseB"} {
-		for i := 0; i < 2; i++ {
-			p.Record(k, pool.VerdictBlocked, time.Millisecond, "")
-		}
+		block(p, k)
 	}
 	proxyAddr := startForward(t, p, resin.ln.Addr().String())
 

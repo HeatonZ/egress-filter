@@ -26,6 +26,7 @@ import (
 
 	"github.com/HeatonZ/egress-filter/internal/app"
 	"github.com/HeatonZ/egress-filter/internal/entry"
+	"github.com/HeatonZ/egress-filter/internal/mitm"
 	"github.com/HeatonZ/egress-filter/internal/pool"
 	"github.com/HeatonZ/egress-filter/internal/resin"
 )
@@ -128,6 +129,40 @@ func main() {
 		}
 	}()
 
+	// The terminating proxy is optional: it requires every client to trust its
+	// CA, which is a deployment decision rather than a default.
+	var termLn net.Listener
+	if cfg.TerminateAddr != "" {
+		ca, err := mitm.LoadOrCreate(cfg.CAFile)
+		if err != nil {
+			log.Error("load ca", "dir", cfg.CAFile, "error", err)
+			os.Exit(1)
+		}
+		term := &entry.Terminator{
+			Pool:        p,
+			Log:         log,
+			CA:          ca,
+			Upstream:    cfg.ProxyAddr,
+			Token:       cfg.ProxyToken,
+			Platform:    cfg.Platform,
+			DialTimeout: 15 * time.Second,
+			Evictor:     sched,
+		}
+		termLn, err = net.Listen("tcp", cfg.TerminateAddr)
+		if err != nil {
+			log.Error("terminate listen", "addr", cfg.TerminateAddr, "error", err)
+			os.Exit(1)
+		}
+		termSrv := &http.Server{Handler: term, ReadHeaderTimeout: 30 * time.Second}
+		go func() {
+			log.Info("terminating forward proxy listening", "addr", cfg.TerminateAddr,
+				"ca_cert", cfg.CAFile+"/ca.crt")
+			if err := termSrv.Serve(termLn); err != nil && err != http.ErrServerClosed {
+				log.Error("terminate server", "error", err)
+			}
+		}()
+	}
+
 	go sched.Run(ctx)
 
 	<-ctx.Done()
@@ -143,6 +178,11 @@ type config struct {
 	ReverseAddr string
 	ForwardAddr string
 	StatusAddr  string
+
+	// TerminateAddr serves a TLS-terminating forward proxy, which is the only
+	// forward shape that can see HTTP status codes.
+	TerminateAddr string
+	CAFile        string
 
 	ResinURL   string
 	ResinToken string
@@ -167,6 +207,8 @@ func loadConfig() config {
 		ReverseAddr:       env("EF_LISTEN_REVERSE", ":8080"),
 		ForwardAddr:       env("EF_LISTEN_FORWARD", ":1080"),
 		StatusAddr:        env("EF_LISTEN_STATUS", ":9090"),
+		TerminateAddr:     env("EF_LISTEN_TERMINATE", ""),
+		CAFile:            env("EF_CA_DIR", "/data/ca"),
 		ResinURL:          env("EF_RESIN_URL", "http://resin:2260"),
 		ResinToken:        env("EF_RESIN_TOKEN", ""),
 		Platform:          env("EF_PLATFORM", "opencode"),
@@ -177,7 +219,7 @@ func loadConfig() config {
 		ProbeInterval:     duration("EF_PROBE_INTERVAL", 10*time.Minute),
 		DiscoveryInterval: duration("EF_DISCOVERY_INTERVAL", 60*time.Second),
 		ProbeConcurrency:  integer("EF_PROBE_CONCURRENCY", 4),
-		FailThreshold:     integer("EF_FAIL_THRESHOLD", 2),
+		FailThreshold:     integer("EF_FAIL_THRESHOLD", 5),
 		RecoverThreshold:  integer("EF_RECOVER_THRESHOLD", 2),
 		Evict:             boolean("EF_EVICT", false),
 		EvictCooldown:     duration("EF_EVICT_COOLDOWN", 10*time.Minute),
