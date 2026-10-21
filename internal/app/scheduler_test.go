@@ -188,3 +188,34 @@ func keysOf(snaps []pool.Snapshot) []string {
 	}
 	return out
 }
+
+// A client can name a lease discovery has never seen, because Resin creates it
+// on demand. Eviction must still reach the right instance for such a route, and
+// must delete the bare lease name.
+func TestEvictClientNamedLease(t *testing.T) {
+	f := newFakeResin(t)
+	f.leases["p2"] = []resin.Lease{{Account: "other"}}
+
+	p := newPool()
+	s := New(p, nil, Config{Platform: "opencode", Evict: true, EvictCooldown: time.Minute}, quiet())
+	s.Sources = []Source{
+		{Name: "a", Client: resin.New(f.srv.URL, "ta"), PlatformID: "p1"},
+		{Name: "b", Client: resin.New(f.srv.URL, "tb"), PlatformID: "p2"},
+	}
+	s.discover(context.Background())
+
+	// The client pins a lease on instance b that discovery does not list.
+	p.Ensure(pool.Route{Key: "b/brandnew", Lease: "brandnew", Upstream: "b"})
+	for i := 0; i < 5; i++ {
+		p.Record("b/brandnew", pool.VerdictBlocked, 0, "blocked")
+	}
+
+	s.evict(context.Background(), "b/brandnew")
+
+	if len(f.deletes) != 1 || f.deletes[0] != "p2/brandnew" {
+		t.Fatalf("deletes = %v, want [p2/brandnew]", f.deletes)
+	}
+	if f.tokens["p2"] != "tb" {
+		t.Fatalf("delete used token %q, want tb", f.tokens["p2"])
+	}
+}

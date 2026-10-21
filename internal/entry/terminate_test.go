@@ -509,6 +509,10 @@ func TestTerminateUpstreamQualifierSelectsInstance(t *testing.T) {
 	})
 
 	tt := newTestTerminator(t, p, &recordingEvictor{})
+	tt.Upstreams = Upstreams{
+		"a": {Name: "a", ProxyAddr: "resin-a:2260", Token: "ta"},
+		"b": {Name: "b", ProxyAddr: "resin-b:2260", Token: "tb"},
+	}
 	addr := strings.TrimPrefix(up.URL, "https://")
 	tt.dial = func(account, target string) (net.Conn, error) {
 		return net.Dial("tcp", addr)

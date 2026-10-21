@@ -36,6 +36,26 @@ socks5h://opencode.freeproxy30:any@egress-filter:1080
 http://opencode.auto:any@egress-filter:1080
 ```
 
+## The caller decides the lease
+
+A lease name in the request is passed through to Resin unchanged. Resin creates a
+lease on first use, so a name a caller just configured works immediately — this
+layer does not require a discovery pass to have listed it first. Discovery only
+reports what already exists, to learn egress IPs and to find leases worth
+evicting.
+
+Consequences worth knowing:
+
+- A route a caller names stays in the pool across discovery refreshes, keeping
+  its failure streak, until discovery adopts it. Once adopted it behaves like any
+  discovered route and disappears when the lease does.
+- A lease that live traffic has already proved blocked is refused rather than
+  forwarded. That is positive evidence, not absence of evidence, so it outranks
+  the caller's wish.
+- The reverse entry falls back to another route when the named lease is blocked;
+  the forward entries fail instead, because a client that pinned a name has its
+  own lease table and silent rerouting would break its session affinity.
+
 ## Passive only
 
 There is no active prober. Probing would consume the same upstream quota the

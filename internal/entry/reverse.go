@@ -102,7 +102,10 @@ func (r *Reverse) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	targetPath := "/" + token + "/" + platform + "." + used + "/" + proto + "/" + host
+	// The path carries the lease the caller asked for, verbatim. Resin creates
+	// a lease on first use, so forwarding the name is what makes a freshly
+	// configured account work without waiting for discovery to list it.
+	targetPath := "/" + token + "/" + platform + "." + route.Lease + "/" + proto + "/" + host
 	if rest != "" {
 		targetPath += "/" + rest
 	}
@@ -165,18 +168,22 @@ func (r *Reverse) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // for session affinity: one account is one egress, and switching egress pads the
 // upstream's prompt cache. Failover only happens when it is not healthy.
 func (r *Reverse) choose(requested string, h http.Header) (pool.Route, string) {
-	if requested != "" && requested != "auto" {
-		for _, s := range r.Pool.Snapshots() {
-			if s.Lease == requested && s.State != pool.StateBlocked {
-				return s.Route, requested
-			}
+	if route, ok := PinRoute(r.Upstreams, requested); ok {
+		// A named lease is used as given: discovery only reports what exists,
+		// while the caller decides what to use. A withdrawn one falls through to
+		// the pool instead, because this entry is how a caller without its own
+		// lease table gets an egress at all.
+		route = r.Pool.Ensure(route)
+		if !r.Pool.Blocked(route.Key) {
+			return route, route.Key
 		}
 	}
 	// Callers may pin a route explicitly for testing.
 	if pinned := h.Get("X-Egress-Pin"); pinned != "" {
-		for _, s := range r.Pool.Snapshots() {
-			if s.Lease == pinned && s.State != pool.StateBlocked {
-				return s.Route, pinned
+		if route, ok := PinRoute(r.Upstreams, pinned); ok {
+			route = r.Pool.Ensure(route)
+			if !r.Pool.Blocked(route.Key) {
+				return route, route.Key
 			}
 		}
 	}

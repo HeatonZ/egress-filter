@@ -167,3 +167,35 @@ func TestReverseRejectsForeignPlatform(t *testing.T) {
 }
 
 func TestMain(m *testing.M) { os.Exit(m.Run()) }
+
+// A lease the caller names must be forwarded as-is even when discovery has not
+// listed it: Resin creates the lease on first use, so requiring discovery would
+// reject exactly the account the caller just configured.
+func TestReversePassesThroughUnknownLease(t *testing.T) {
+	var gotPath string
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(200)
+		io.WriteString(w, "ok")
+	}))
+	defer fake.Close()
+
+	r := NewReverse(seeded(), fake.URL, "opencode", quietLogger())
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/11123zzzsf/opencode.brandnew/https/opencode.ai/x",
+		"application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 for a lease Resin will create", resp.StatusCode)
+	}
+	if !strings.HasPrefix(gotPath, "/11123zzzsf/opencode.brandnew/") {
+		t.Fatalf("upstream path = %q, want the caller's lease passed through", gotPath)
+	}
+}

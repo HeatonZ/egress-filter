@@ -263,24 +263,16 @@ func (t *Terminator) authorized(pass string) bool {
 }
 
 func (t *Terminator) choose(pinned string) (pool.Route, string) {
-	upstream, lease := splitPreferred(pinned)
-	if lease != "" && lease != "auto" {
-		for _, s := range t.Pool.Snapshots() {
-			if s.Lease != lease {
-				continue
-			}
-			if upstream != "" && s.Upstream != upstream {
-				continue
-			}
-			// A withdrawn pin must fail rather than fall back: falling back is
-			// exactly the silent rerouting that makes per-account pools
-			// unpredictable under load.
-			if s.State == pool.StateBlocked {
-				return pool.Route{}, ""
-			}
-			return s.Route, s.Key
+	if route, ok := PinRoute(t.Upstreams, pinned); ok {
+		// The caller names the lease, so it is used whether or not discovery has
+		// listed it yet: Resin creates it on demand. Only a lease traffic has
+		// already proved blocked is refused, because that is positive evidence
+		// rather than absence of evidence.
+		route = t.Pool.Ensure(route)
+		if t.Pool.Blocked(route.Key) {
+			return pool.Route{}, ""
 		}
-		return pool.Route{}, ""
+		return route, route.Key
 	}
 	route, ok := t.Pool.Pick()
 	if !ok {

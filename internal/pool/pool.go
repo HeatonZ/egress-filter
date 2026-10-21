@@ -149,6 +149,10 @@ type entry struct {
 	// lastEvictAt records the last time this route's lease was deleted, so a
 	// single noisy window cannot trigger repeated deletions.
 	lastEvictAt time.Time
+	// lazy marks a route a client named before discovery listed it. Resin
+	// creates a lease on first use, so such a route is real even though the
+	// last discovery pass did not know it yet.
+	lazy bool
 }
 
 // Pool is the shared route registry.
@@ -171,6 +175,27 @@ func New(opts Options) *Pool {
 
 // Options returns the effective options.
 func (p *Pool) Options() Options { return p.opts }
+
+// Ensure returns the route for a lease a client named, creating it when
+// discovery has not seen it.
+//
+// The client is the authority on which lease to use: Resin creates the lease on
+// demand, so requiring a discovery pass first would reject exactly the accounts
+// a caller just configured. A created route starts ready for the same reason
+// discovered ones do — with passive observation nothing else would ever make it
+// usable.
+func (p *Pool) Ensure(r Route) Route {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if e, ok := p.entries[r.Key]; ok {
+		return e.route
+	}
+	e := &entry{route: r, state: StateReady, lazy: true}
+	p.entries[r.Key] = e
+	p.order = append(p.order, r.Key)
+	return r
+}
 
 // Sync replaces the route set with routes, preserving the health of routes that
 // already exist. A route that disappears from routes is dropped along with its
@@ -202,13 +227,31 @@ func (p *Pool) Sync(routes []Route) {
 			p.entries[r.Key] = e
 		}
 		// Identity fields follow the current discovery result; health fields
-		// stay with the route.
+		// stay with the route. Seeing it upstream makes it a discovered route.
 		e.route = r
+		e.lazy = false
 	}
-	for key := range p.entries {
-		if _, ok := seen[key]; !ok {
-			delete(p.entries, key)
+	// A route a client pinned keeps its place until discovery lists it. Dropping
+	// it here would make the next request recreate it from scratch and lose the
+	// failure streak we were counting toward eviction.
+	for _, key := range p.order {
+		if _, ok := seen[key]; ok {
+			continue
 		}
+		if e, ok := p.entries[key]; ok && e.lazy {
+			order = append(order, key)
+		}
+	}
+	for key, e := range p.entries {
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		// Routes that were adopted by discovery and now vanished are genuinely
+		// gone; lazy ones only exist because a client keeps naming them.
+		if e.lazy {
+			continue
+		}
+		delete(p.entries, key)
 	}
 	p.order = order
 }

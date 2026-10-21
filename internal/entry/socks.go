@@ -277,17 +277,14 @@ func (f *Forward) tunnel(c net.Conn, br *bufio.Reader, target, preferred string,
 }
 
 func (f *Forward) choose(preferred string) (pool.Route, string) {
-	upstream, lease := splitPreferred(preferred)
-	if lease != "" && lease != "auto" {
-		for _, s := range f.Pool.Snapshots() {
-			if s.Lease != lease || s.State == pool.StateBlocked {
-				continue
-			}
-			if upstream != "" && s.Upstream != upstream {
-				continue
-			}
-			return s.Route, s.Key
+	if route, ok := PinRoute(f.Upstreams, preferred); ok {
+		// Same rule as the reverse entry: the caller decides the lease, Resin
+		// creates it on demand, so discovery is not a precondition.
+		route = f.Pool.Ensure(route)
+		if f.Pool.Blocked(route.Key) {
+			return pool.Route{}, ""
 		}
+		return route, route.Key
 	}
 	route, ok := f.Pool.Pick()
 	if !ok {

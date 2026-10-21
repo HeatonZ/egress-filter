@@ -9,7 +9,6 @@ package app
 import (
 	"context"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -226,28 +225,39 @@ func (s *Scheduler) evict(ctx context.Context, account string) {
 }
 
 // ownerOf resolves a route key to the instance that owns it and the bare lease
-// name that instance knows. Keys only carry the instance prefix when more than
-// one instance is configured.
+// name that instance knows.
+//
+// Discovery is not the authority here: a route can exist because a client named
+// a lease Resin has not been asked for before. The route itself records its
+// instance, so eviction follows that and only falls back to the discovered
+// owner map when the route does not say.
 func (s *Scheduler) ownerOf(key string) (Source, string, bool) {
 	s.mu.Lock()
-	src, ok := s.owners[key]
+	owner, known := s.owners[key]
 	s.mu.Unlock()
 
-	if ok && src.Name != "" && strings.HasPrefix(key, src.Name+"/") {
-		return src, strings.TrimPrefix(key, src.Name+"/"), true
-	}
-	// The pool snapshot is authoritative for the lease name; the key is only a
-	// label once several instances are in play.
-	for _, sn := range s.Pool.Snapshots() {
-		if sn.Key == key {
-			if !ok {
-				fallback := s.sources()
-				if len(fallback) == 1 {
-					src, ok = fallback[0], true
-				}
-			}
-			return src, sn.Lease, ok
+	var sn pool.Snapshot
+	found := false
+	for _, cand := range s.Pool.Snapshots() {
+		if cand.Key == key {
+			sn, found = cand, true
+			break
 		}
+	}
+	if !found {
+		return Source{}, "", false
+	}
+
+	if known {
+		return owner, sn.Lease, true
+	}
+	for _, src := range s.sources() {
+		if src.Name == sn.Upstream {
+			return src, sn.Lease, true
+		}
+	}
+	if single := s.sources(); len(single) == 1 {
+		return single[0], sn.Lease, true
 	}
 	return Source{}, "", false
 }

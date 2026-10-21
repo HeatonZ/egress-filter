@@ -1,6 +1,10 @@
 package entry
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/HeatonZ/egress-filter/internal/pool"
+)
 
 // Upstream is one Resin instance the pool draws leases from.
 //
@@ -58,6 +62,42 @@ func splitPreferred(username string) (upstream, lease string) {
 		upstream, u = u[:i], u[i+1:]
 	}
 	return upstream, normalisePreferred(u)
+}
+
+// PinRoute turns a client's proxy username into the route it names.
+//
+// Resin creates a lease the first time it is used, so a name a caller just
+// configured is legitimate before any discovery pass has listed it. Treating
+// discovery as the authority would reject exactly those names, which is
+// backwards: the caller decides which lease to use, discovery only reports what
+// already exists.
+func PinRoute(ups Upstreams, username string) (pool.Route, bool) {
+	upstream, lease := splitPreferred(username)
+	if lease == "" || lease == "auto" {
+		return pool.Route{}, false
+	}
+	multi := len(ups) > 1
+	if upstream == "" {
+		if multi {
+			upstream = DefaultUpstream
+		} else {
+			upstream = ups.singleName()
+		}
+	}
+	key := lease
+	if multi {
+		key = upstream + "/" + lease
+	}
+	return pool.Route{Key: key, Lease: lease, Upstream: upstream}, true
+}
+
+// singleName is the only configured instance's name, or the default when the
+// registry is empty.
+func (u Upstreams) singleName() string {
+	for name := range u {
+		return name
+	}
+	return DefaultUpstream
 }
 
 // Names returns the configured instance names, sorted for stable output.
