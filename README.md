@@ -68,16 +68,22 @@ There is no active prober. Probing would consume the same upstream quota the
 real requests need, and its results are polluted by the rate limiting it causes.
 Evidence comes from traffic that was going to be sent anyway.
 
-Each response is classified into three outcomes, not two:
+Each response is classified into two outcomes, not three:
 
-- **200** — the egress works; clears failures
-- **403 with a block message** — the egress is refused; counts toward withdrawal
-- **403 with a shape message, 400, 429, 5xx** — no evidence about the egress
+- **2xx** — the egress works; clears the failure streak
+- **anything else** — 403, 400, 429, 5xx, a transport error, a timeout — the
+  route did not serve this request, so it counts toward withdrawal
 
-That third case is the important one. `403 can only be used from within OpenCode`
-means the request shape is wrong, and `context_length_exceeded` (a 400) means the
-conversation is too long. Neither says anything about the egress, and treating
-either as a failure drains the pool for nothing.
+The status code and body stay in `lastDetail` so operators can tell a blocked
+egress from a rate-limited one, but the count does not distinguish them. A
+route that keeps failing is not carrying traffic whatever the reason, and the
+fresh lease is what gives it another chance.
+
+429 deserves a note because it is the most common failure against a free tier:
+it is the upstream's quota talking, not necessarily this egress being bad, so a
+rotation will often land on another route that is equally rate-limited. It still
+counts — the request did fail — but if the whole pool is answering 429, the
+shortage is upstream and no amount of rotation fixes it.
 
 ## The forward entry cannot see status codes
 
@@ -102,10 +108,24 @@ picks one.
 
 ## Withdrawal
 
-After `EF_FAIL_THRESHOLD` consecutive blocked responses the route is withheld,
-and its lease binding is deleted so Resin re-allocates it. Deletion is
-rate-limited per account (`EF_EVICT_COOLDOWN`) so one noisy window cannot churn
-the same lease repeatedly.
+After `EF_FAIL_THRESHOLD` consecutive failures the route is withheld, and its
+lease binding is deleted so Resin re-allocates it. Deletion is rate-limited per
+account (`EF_EVICT_COOLDOWN`) so one noisy window cannot churn the same lease
+repeatedly.
+
+**A withdrawal is always a pause, never a retirement.** Every entry that
+withdraws a route asks for eviction (reverse, TLS-terminating, and SOCKS5 — the
+last one on a failed dial, which is all a byte tunnel can observe). When the
+lease is deleted the streak is cleared in the same step: the failures belonged
+to the old egress, and carrying them onto the new one would withdraw it again on
+its first unlucky response. When no deletion happens — eviction disabled, no
+owning upstream, a failed delete, a second withdrawal inside the cooldown, a
+full queue — the streak is cleared in place instead, because a withheld route is
+never selected and so could never record the success that clears it.
+
+`EF_BLOCKED_TTL` is the backstop behind all of that: any withdrawal still in
+place after it is reopened, whoever failed to release it. A route must never be
+stuck, whatever any caller did or failed to do.
 
 Eviction is **off by default**. Run a while with `EF_EVICT=false` and read
 `/status` before enabling it.
@@ -131,6 +151,7 @@ Eviction is **off by default**. Run a while with `EF_EVICT=false` and read
 | `EF_EVICT` | `false` | delete leases of blocked routes |
 | `EF_EVICT_COOLDOWN` | `10m` | minimum gap between deletions of one account |
 | `EF_LAZY_TTL` | `10m` | how long a client-named lease discovery never lists stays in the pool |
+| `EF_BLOCKED_TTL` | `2m` | how long a withdrawal holds before the route is reopened regardless |
 
 ## Several Resin instances
 

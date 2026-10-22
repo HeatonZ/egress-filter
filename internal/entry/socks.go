@@ -45,6 +45,12 @@ type Forward struct {
 	Platform string
 	// DialTimeout bounds the hop to the upstream proxy.
 	DialTimeout time.Duration
+	// Evictor is notified when this entry's own traffic withdraws a route, so
+	// the lease behind it can be deleted and re-allocated. Without it the SOCKS
+	// entry would record failures it never acts on, and a withdrawn route is
+	// never selected — so nothing would ever clear it and the egress would sit
+	// out of the pool until BlockedTTL expired.
+	Evictor Evictor
 }
 
 // Serve accepts connections until the listener closes.
@@ -247,6 +253,7 @@ func (f *Forward) tunnel(c net.Conn, br *bufio.Reader, target, preferred string,
 	if err != nil {
 		f.Log.Warn("forward dial", "route", account, "target", target, "error", err)
 		f.Pool.Record(route.Key, pool.VerdictUnknown, 0, "forward dial: "+err.Error())
+		f.evictIfBlocked(route.Key)
 		onFailure()
 		return
 	}
@@ -453,6 +460,20 @@ func parseProxyAuth(h string) (user, pass string, ok bool) {
 }
 
 var _ = context.Background
+
+// evictIfBlocked hands a route this entry just withdrew to the evictor, so the
+// lease behind it is deleted and re-allocated.
+//
+// The SOCKS5 entry sees no HTTP status — only whether the tunnel came up — so
+// its only evidence is a dial failure. That is still real evidence about the
+// egress, and recording it without acting on it was how a route could reach the
+// threshold here and then never be selected again: the failures stopped, so
+// nothing ever queued another attempt.
+func (f *Forward) evictIfBlocked(key string) {
+	if f.Evictor != nil && f.Pool.Blocked(key) {
+		f.Evictor.Evict(key)
+	}
+}
 
 // authorized reports whether pass is this entry's own password. An empty
 // configured password leaves the entry open, which is only useful for tests.

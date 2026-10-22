@@ -308,6 +308,65 @@ func TestServerErrorCountsAndSuccessResetsIt(t *testing.T) {
 	}
 }
 
+// A withdrawal is a pause, never a retirement. Whatever path failed to release
+// it, an egress must come back inside BlockedTTL — otherwise a route that is
+// never selected can never record the success that would clear it.
+func TestWithdrawalExpiresSoNoRouteIsStuck(t *testing.T) {
+	now := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	p := New(Options{Now: func() time.Time { return now }})
+	seed(p, "a", "b")
+
+	failN(p, "a", defaultThreshold)
+	if !p.Blocked("a") {
+		t.Fatal("precondition: a should be blocked")
+	}
+
+	// Still inside the TTL: the withdrawal holds.
+	now = now.Add(p.Options().BlockedTTL / 2)
+	if !p.Blocked("a") {
+		t.Fatal("the withdrawal expired early")
+	}
+
+	// Past the TTL: reopened with a clean streak, without any caller releasing
+	// it and without any success having been observed.
+	now = now.Add(p.Options().BlockedTTL)
+	if p.Blocked("a") {
+		t.Fatal("a withdrawal past BlockedTTL must not survive")
+	}
+	sn := snapshotForKey(p, "a")
+	if sn.ConsecFail != 0 || sn.State != StateReady {
+		t.Fatalf("after expiry want ready/0 failures, got %v/%d", sn.State, sn.ConsecFail)
+	}
+	// And it must be selectable again, or the expiry would be cosmetic.
+	if _, ok := p.Pick(); !ok {
+		t.Fatal("no route selectable after the withdrawal expired")
+	}
+}
+
+// An expired withdrawal must be released by the read paths too, not only by a
+// background tick: the entries consult Blocked and Pick on every request.
+func TestBlockedReleasesItsOwnExpiry(t *testing.T) {
+	now := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	p := New(Options{Now: func() time.Time { return now }})
+	seed(p, "a")
+
+	failN(p, "a", defaultThreshold)
+	now = now.Add(p.Options().BlockedTTL + time.Second)
+
+	if p.Blocked("a") {
+		t.Fatal("Blocked did not release its own expired withdrawal")
+	}
+}
+
+func snapshotForKey(p *Pool, key string) Snapshot {
+	for _, s := range p.Snapshots() {
+		if s.Key == key {
+			return s
+		}
+	}
+	return Snapshot{}
+}
+
 func TestIsTimeoutRecognisesDeadlines(t *testing.T) {
 	if IsTimeout(io.EOF) {
 		t.Fatal("EOF is a refusal, not a deadline")

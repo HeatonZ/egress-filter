@@ -127,6 +127,15 @@ type Options struct {
 	// use, while discovery still does not list it. Without an expiry a one-off
 	// typo would stay in the pool and in /status forever.
 	LazyTTL time.Duration
+	// BlockedTTL bounds how long a route stays withdrawn.
+	//
+	// A withdrawal is a pause, never a retirement. The data paths clear it when
+	// they act on it, but a path with no evictor, a failed delete, or a delete
+	// refused by the cooldown would otherwise leave the route out of selection
+	// for good — and a route that is never selected can never record the
+	// success that would bring it back. This TTL is the structural guarantee
+	// that no egress is stuck, whatever the caller did or failed to do.
+	BlockedTTL time.Duration
 	// Now is injectable for tests.
 	Now func() time.Time
 }
@@ -143,6 +152,12 @@ func (o Options) withDefaults() Options {
 	}
 	if o.LazyTTL <= 0 {
 		o.LazyTTL = 10 * time.Minute
+	}
+	if o.BlockedTTL <= 0 {
+		// Long enough that a legitimate eviction still gets its fresh lease,
+		// short enough that a route stranded by any failure path comes back
+		// inside one working session.
+		o.BlockedTTL = 2 * time.Minute
 	}
 	if o.Now == nil {
 		o.Now = time.Now
@@ -166,6 +181,11 @@ type entry struct {
 	// lastEvictAt records the last time this route's lease was deleted, so a
 	// single noisy window cannot trigger repeated deletions.
 	lastEvictAt time.Time
+	// blockedAt is when the route was withdrawn. It exists so the withdrawal
+	// can expire: a route that is never selected can never record the success
+	// that would clear it, so without a deadline any missed release path would
+	// retire the egress permanently.
+	blockedAt time.Time
 	// lazy marks a route a client named before discovery listed it. Resin
 	// creates a lease on first use, so such a route is real even though the
 	// last discovery pass did not know it yet.
@@ -304,6 +324,7 @@ func (p *Pool) Record(key string, v Verdict, latency time.Duration, detail strin
 		// without ever serving is withdrawn.
 		if e.state == StateBlocked && e.consecOK >= p.opts.RecoverThreshold {
 			e.state = StateReady
+			e.blockedAt = time.Time{}
 		} else if e.state == StateSuspect && e.consecOK >= 1 {
 			e.state = StateReady
 		}
@@ -316,11 +337,50 @@ func (p *Pool) Record(key string, v Verdict, latency time.Duration, detail strin
 		e.consecFail++
 		e.consecOK = 0
 		if e.consecFail >= p.opts.FailThreshold {
+			if e.state != StateBlocked {
+				e.blockedAt = now
+			}
 			e.state = StateBlocked
 		} else {
 			e.state = StateSuspect
 		}
 	}
+}
+
+// releaseExpired reopens every withdrawal older than BlockedTTL and returns the
+// keys it released, assuming p.mu is held.
+//
+// A withdrawn route is never selected, so it cannot record the success that
+// would clear it. Every release path clears the streak when it acts, but a
+// caller that never acts — an entry with no evictor, a delete the cooldown
+// refused, a control plane that was down — would otherwise leave the route out
+// of the pool for the life of the process. This is the backstop: a withdrawal
+// is always a pause, and this is what makes that true regardless of callers.
+func (p *Pool) releaseExpired(now time.Time) []string {
+	var keys []string
+	for _, key := range p.order {
+		e := p.entries[key]
+		if e == nil || e.state != StateBlocked || e.blockedAt.IsZero() {
+			continue
+		}
+		if now.Sub(e.blockedAt) < p.opts.BlockedTTL {
+			continue
+		}
+		e.state = StateReady
+		e.consecOK = 0
+		e.consecFail = 0
+		e.blockedAt = time.Time{}
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+// ReleaseExpired reopens withdrawals that have outlived BlockedTTL and reports
+// which routes came back. Exported so the scheduler can log them on its tick.
+func (p *Pool) ReleaseExpired() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.releaseExpired(p.opts.Now())
 }
 
 // IsTimeout reports whether err is a deadline rather than a refusal, so callers
@@ -334,9 +394,14 @@ func IsTimeout(err error) bool {
 }
 
 // Blocked reports whether the route has been withdrawn from selection.
+//
+// An expired withdrawal is released here rather than only on the scheduler
+// tick, so no caller — however it fails to act — can keep an egress out of the
+// pool past BlockedTTL.
 func (p *Pool) Blocked(key string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.releaseExpired(p.opts.Now())
 	e, ok := p.entries[key]
 	return ok && e.state == StateBlocked
 }
@@ -390,6 +455,7 @@ func (p *Pool) Reset(key string) {
 		e.lastVerdict = VerdictUnknown
 		e.lastDetail = ""
 		e.lastError = ""
+		e.blockedAt = time.Time{}
 	}
 }
 
@@ -407,6 +473,11 @@ func (p *Pool) SetError(key, msg string) {
 func (p *Pool) Pick() (Route, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// An expired withdrawal must not hide a route from selection: with passive
+	// observation, being selected is the only way a route can ever prove it
+	// works again.
+	p.releaseExpired(p.opts.Now())
 
 	best := -1
 	bestScore := -1

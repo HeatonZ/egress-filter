@@ -106,9 +106,20 @@ func (s *Scheduler) Run(ctx context.Context) {
 			return
 		case <-discTick.C:
 			s.discover(ctx)
+			s.releaseExpired()
 		case account := <-s.evictCh:
 			s.evict(ctx, account)
 		}
+	}
+}
+
+// releaseExpired logs withdrawals the pool reopened because they outlived
+// BlockedTTL. The pool releases them on its own wherever it is consulted; this
+// only makes the recovery visible in the log, so a route that was stranded by a
+// failure path can be told apart from one that simply recovered.
+func (s *Scheduler) releaseExpired() {
+	for _, key := range s.Pool.ReleaseExpired() {
+		s.Log.Warn("withdrawal expired, route reopened", "account", key)
 	}
 }
 
@@ -272,7 +283,8 @@ func (s *Scheduler) releaseWithdrawal(key string) {
 // route is never selected, so it can never record the success that would clear
 // it. Every withdrawal is therefore released where it is handled — after the
 // lease is deleted, after a failed delete, and when the cooldown refuses a
-// second deletion — and no timer is needed.
+// second deletion — and Pool.BlockedTTL reopens anything a path still missed.
+// No timer in this package is needed for correctness.
 
 // ownerOf resolves a route key to the instance that owns it and the bare lease
 // name that instance knows.

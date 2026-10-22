@@ -47,6 +47,7 @@ func main() {
 		FailThreshold:    cfg.FailThreshold,
 		RecoverThreshold: cfg.RecoverThreshold,
 		LazyTTL:          cfg.LazyTTL,
+		BlockedTTL:       cfg.BlockedTTL,
 	})
 	// One registry is shared by every entry: a route carries the name of the
 	// Resin instance that owns its lease, and the entry dials that instance with
@@ -99,6 +100,10 @@ func main() {
 	}, log)
 	sched.Sources = sources
 	rev.Evictor = sched
+	// The SOCKS5 entry needs the same evictor: it records dial failures, and a
+	// recorded failure nobody acts on is what leaves a route withdrawn with no
+	// way back.
+	fwd.Evictor = sched
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -243,6 +248,9 @@ type config struct {
 	EvictCooldown     time.Duration
 	// LazyTTL expires a route a client named that discovery never lists.
 	LazyTTL time.Duration
+	// BlockedTTL bounds how long a route stays withdrawn before it is reopened
+	// regardless of whether anything released it. A withdrawal is a pause.
+	BlockedTTL time.Duration
 	// HeaderTimeout bounds how long one egress may take to answer with
 	// response headers before the attempt counts as a timeout.
 	HeaderTimeout time.Duration
@@ -281,6 +289,7 @@ func loadConfig() config {
 		Evict:             boolean("EF_EVICT", false),
 		EvictCooldown:     duration("EF_EVICT_COOLDOWN", 10*time.Minute),
 		LazyTTL:           duration("EF_LAZY_TTL", 10*time.Minute),
+		BlockedTTL:        duration("EF_BLOCKED_TTL", 2*time.Minute),
 		HeaderTimeout:     duration("EF_UPSTREAM_HEADER_TIMEOUT", 60*time.Second),
 	}
 	// The aggregator password defaults to the old single-instance token so an
