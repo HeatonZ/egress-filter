@@ -219,3 +219,116 @@ func TestEvictClientNamedLease(t *testing.T) {
 		t.Fatalf("delete used token %q, want tb", f.tokens["p2"])
 	}
 }
+
+// Eviction must clear the failure streak it just acted on. The failures belonged
+// to the old egress; carrying them over would withdraw the re-allocated route on
+// its first unlucky response.
+func TestEvictClearsTheStreakItActedOn(t *testing.T) {
+	f := newFakeResin(t)
+	f.leases["p1"] = []resin.Lease{{Account: "leaseA", EgressIP: "1.1.1.1"}}
+	p := newPool()
+	s := New(p, resin.New(f.srv.URL, "ta"),
+		Config{PlatformID: "p1", Platform: "opencode", Evict: true, EvictCooldown: time.Minute}, quiet())
+	s.discover(context.Background())
+
+	for i := 0; i < 5; i++ {
+		p.Record("leaseA", pool.VerdictServerError, 0, "upstream 429")
+	}
+	if !p.Blocked("leaseA") {
+		t.Fatalf("setup: leaseA should be blocked")
+	}
+
+	s.evict(context.Background(), "leaseA")
+
+	if len(f.deletes) != 1 {
+		t.Fatalf("deletes = %v, want one delete", f.deletes)
+	}
+	if p.Blocked("leaseA") {
+		t.Fatal("leaseA stayed blocked after its lease was deleted and re-allocated")
+	}
+	for _, sn := range p.Snapshots() {
+		if sn.Key == "leaseA" && sn.ConsecFail != 0 {
+			t.Fatalf("consec_fail = %d, want 0 after eviction", sn.ConsecFail)
+		}
+	}
+	if _, ok := p.Pick(); !ok {
+		t.Fatal("the re-allocated route must be selectable again")
+	}
+}
+
+// A deletion that fails must not retire the route either: blocked routes are
+// never selected, so nothing else would ever queue another attempt.
+func TestFailedEvictionStillReleasesTheWithdrawal(t *testing.T) {
+	f := newFakeResin(t)
+	f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			http.Error(w, "control plane down", http.StatusBadGateway)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"items": []resin.Lease{{Account: "leaseA"}}, "total": 1,
+		})
+	})
+	p := newPool()
+	s := New(p, resin.New(f.srv.URL, "ta"),
+		Config{PlatformID: "p1", Platform: "opencode", Evict: true, EvictCooldown: time.Minute}, quiet())
+	s.discover(context.Background())
+
+	for i := 0; i < 5; i++ {
+		p.Record("leaseA", pool.VerdictServerError, 0, "upstream 429")
+	}
+	s.evict(context.Background(), "leaseA")
+
+	if s.EvictFailed() != 1 {
+		t.Fatalf("evict_failed = %d, want 1", s.EvictFailed())
+	}
+	if p.Blocked("leaseA") {
+		t.Fatal("a failed deletion must not leave the route blocked forever")
+	}
+}
+
+// A route withdrawn twice inside the cooldown window has no deletion to perform,
+// and must not stay withdrawn because of it.
+func TestEvictionInsideCooldownReleasesTheWithdrawal(t *testing.T) {
+	f := newFakeResin(t)
+	f.leases["p1"] = []resin.Lease{{Account: "leaseA", EgressIP: "1.1.1.1"}}
+	p := newPool()
+	s := New(p, resin.New(f.srv.URL, "ta"),
+		Config{PlatformID: "p1", Platform: "opencode", Evict: true, EvictCooldown: time.Hour}, quiet())
+	s.discover(context.Background())
+
+	for round := 0; round < 2; round++ {
+		for i := 0; i < 5; i++ {
+			p.Record("leaseA", pool.VerdictServerError, 0, "upstream 429")
+		}
+		s.evict(context.Background(), "leaseA")
+		if p.Blocked("leaseA") {
+			t.Fatalf("round %d: leaseA stayed blocked", round)
+		}
+	}
+	if len(f.deletes) != 1 {
+		t.Fatalf("deletes = %v, want exactly one inside the cooldown", f.deletes)
+	}
+}
+
+// With eviction disabled there is no new lease to wait for, so the withdrawal
+// must be cleared in place instead of retiring the route.
+func TestEvictDisabledStillClearsTheCount(t *testing.T) {
+	f := newFakeResin(t)
+	f.leases["p1"] = []resin.Lease{{Account: "leaseA"}}
+	p := newPool()
+	s := New(p, resin.New(f.srv.URL, "ta"), Config{PlatformID: "p1", Platform: "opencode"}, quiet())
+	s.discover(context.Background())
+
+	for i := 0; i < 5; i++ {
+		p.Record("leaseA", pool.VerdictServerError, 0, "upstream 429")
+	}
+	s.evict(context.Background(), "leaseA")
+
+	if len(f.deletes) != 0 {
+		t.Fatalf("deletes = %v, want none with eviction disabled", f.deletes)
+	}
+	if p.Blocked("leaseA") {
+		t.Fatal("a route must not stay blocked when no eviction will ever re-allocate it")
+	}
+}

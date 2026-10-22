@@ -82,9 +82,12 @@ func (s *Scheduler) Evict(account string) {
 	select {
 	case s.evictCh <- account:
 	default:
-		// Queue full: dropping is better than blocking a user's request. The
-		// next blocked response for this account will queue it again.
+		// Queue full: dropping is better than blocking a user's request, but the
+		// route must not stay withdrawn because of it. A blocked route is never
+		// selected, so nothing else would ever queue it again — clearing the
+		// streak lets the next real request use it and count afresh.
 		s.Log.Warn("evict queue full, dropping request", "account", account)
+		s.releaseWithdrawal(account)
 	}
 }
 
@@ -187,6 +190,10 @@ func (s *Scheduler) discover(ctx context.Context) {
 // evict deletes one account's lease binding if the pool still condemns it.
 func (s *Scheduler) evict(ctx context.Context, account string) {
 	if !s.Cfg.Evict {
+		// Eviction is off, so this route will never get a new lease. Leaving it
+		// withdrawn would retire it permanently: a blocked route is never
+		// selected, so nothing in the passive path could ever clear it.
+		s.releaseWithdrawal(account)
 		return
 	}
 	cooldown := s.Cfg.EvictCooldown
@@ -197,12 +204,21 @@ func (s *Scheduler) evict(ctx context.Context, account string) {
 	if !ok {
 		s.Pool.ReleaseEviction(account)
 		s.Log.Warn("evict: route has no owning upstream", "route", account)
+		// Nothing was deleted, so the failures still stand against a route that
+		// will keep being used. Releasing it lets the count start over instead
+		// of retiring the route for good.
+		s.releaseWithdrawal(account)
 		return
 	}
 
 	// Claim before deleting so concurrent blocked responses for the same
 	// account collapse into one deletion.
 	if !s.Pool.ClaimEviction(account, cooldown) {
+		// Either the lease was already re-allocated inside the cooldown window
+		// or the route recovered while this was queued. Either way it must not
+		// stay withdrawn: nothing in the passive path can clear a route that is
+		// never selected.
+		s.releaseWithdrawal(account)
 		return
 	}
 
@@ -215,14 +231,48 @@ func (s *Scheduler) evict(ctx context.Context, account string) {
 		s.failed++
 		s.mu.Unlock()
 		s.Log.Warn("delete lease failed", "account", lease, "upstream", src.Name, "error", err)
+		// The lease still points at the bad node, but leaving the route blocked
+		// would retire it for good: blocked routes are never selected, so no
+		// further failure would ever queue another delete attempt. Release the
+		// withdrawal and let the next threshold retry the deletion.
+		s.releaseWithdrawal(account)
 		return
 	}
+
+	// The lease is gone, so the next request through this account gets a fresh
+	// node. Clearing the streak in the same step is the whole point of the
+	// design: the failures belonged to the old egress, and carrying them over
+	// would withdraw the route again on its first unlucky response.
+	s.Pool.Reset(account)
 
 	s.mu.Lock()
 	s.evicted++
 	s.mu.Unlock()
 	s.Log.Info("evicted blocked lease", "account", lease, "upstream", src.Name)
 }
+
+// releaseWithdrawal clears the failure streak of a withdrawn route so the next
+// real request can use it and count afresh.
+//
+// This is the other half of "count to the threshold, then delete the lease": the
+// counter belongs to the lease that produced the failures. Once that lease is
+// gone — deleted, or kept because nothing could delete it — carrying the old
+// count forward would withdraw the route again on its very next unlucky
+// response, and since a withdrawn route is never selected nothing in the passive
+// path could ever clear it.
+func (s *Scheduler) releaseWithdrawal(key string) {
+	if !s.Pool.Blocked(key) {
+		return
+	}
+	s.Pool.Reset(key)
+	s.Log.Info("failure count cleared", "account", key)
+}
+
+// sweepWithdrawals is gone on purpose: with passive-only observation a blocked
+// route is never selected, so it can never record the success that would clear
+// it. Every withdrawal is therefore released where it is handled — after the
+// lease is deleted, after a failed delete, and when the cooldown refuses a
+// second deletion — and no timer is needed.
 
 // ownerOf resolves a route key to the instance that owns it and the bare lease
 // name that instance knows.
