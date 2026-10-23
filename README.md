@@ -75,15 +75,22 @@ Each response is classified into two outcomes, not three:
   route did not serve this request, so it counts toward withdrawal
 
 The status code and body stay in `lastDetail` so operators can tell a blocked
-egress from a rate-limited one, but the count does not distinguish them. A
-route that keeps failing is not carrying traffic whatever the reason, and the
-fresh lease is what gives it another chance.
+egress from a rate-limited one.
 
-429 deserves a note because it is the most common failure against a free tier:
-it is the upstream's quota talking, not necessarily this egress being bad, so a
-rotation will often land on another route that is equally rate-limited. It still
-counts — the request did fail — but if the whole pool is answering 429, the
-shortage is upstream and no amount of rotation fixes it.
+**429 is acted on separately.** A rate-limited egress is out of quota right
+now, so it is withdrawn on `EF_RATE_LIMIT_THRESHOLD` consecutive 429s
+(default `1`) instead of the shared `EF_FAIL_THRESHOLD`. Waiting for five kept
+real requests going to a node that could not serve them. Everything else — a
+5xx, a timeout, a 403 that is not the request shape — still needs the full
+streak. Set it higher to make 429s share the ordinary streak.
+
+The failure count advances either way, so `/status` and the logs read the same
+as for any other failure.
+
+Be aware of the trade-off: if the *whole pool* is answering 429, one-response
+rotation churns every lease and fixes nothing, because the shortage is upstream
+quota rather than a bad egress. Watch `evicted_total` against `counts` after
+turning this down.
 
 ## The forward entry cannot see status codes
 
@@ -148,6 +155,7 @@ Eviction is **off by default**. Run a while with `EF_EVICT=false` and read
 | `EF_CA_DIR` | `/data/ca` | where the signing CA is stored; must persist |
 | `EF_DISCOVERY_INTERVAL` | `60s` | lease refresh |
 | `EF_FAIL_THRESHOLD` | `5` | consecutive blocked responses before withdrawal |
+| `EF_RATE_LIMIT_THRESHOLD` | `1` | consecutive 429s before withdrawal; separate because a 429 is a quota state, not bad luck |
 | `EF_EVICT` | `false` | delete leases of blocked routes |
 | `EF_EVICT_COOLDOWN` | `10m` | minimum gap between deletions of one account |
 | `EF_LAZY_TTL` | `10m` | how long a client-named lease discovery never lists stays in the pool |
