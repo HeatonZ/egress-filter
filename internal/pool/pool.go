@@ -124,6 +124,11 @@ type Options struct {
 	// success resets the streak: a route that still serves traffic is not
 	// blocked, however many failures it had before.
 	FailThreshold int
+	// BlockedThreshold is how many consecutive blocked responses (403 that
+	// names this egress) withdraw a route. It is separate from FailThreshold
+	// because a blocked egress is proven dead for this upstream: every further
+	// request through it is wasted, so the default is to rotate at once.
+	BlockedThreshold int
 	// RateLimitThreshold is how many consecutive 429s withdraw a route. It is
 	// separate from FailThreshold because a rate-limited egress is out of
 	// quota right now, not merely unlucky: waiting for the shared threshold
@@ -156,6 +161,9 @@ type Options struct {
 func (o Options) withDefaults() Options {
 	if o.FailThreshold <= 0 {
 		o.FailThreshold = 5
+	}
+	if o.BlockedThreshold <= 0 {
+		o.BlockedThreshold = 1
 	}
 	if o.RateLimitThreshold <= 0 {
 		o.RateLimitThreshold = 1
@@ -358,8 +366,11 @@ func (p *Pool) Record(key string, v Verdict, latency time.Duration, detail strin
 		e.consecFail++
 		e.consecOK = 0
 		threshold := p.opts.FailThreshold
-		if v == VerdictRateLimited {
+		switch v {
+		case VerdictRateLimited:
 			threshold = p.opts.RateLimitThreshold
+		case VerdictBlocked:
+			threshold = p.opts.BlockedThreshold
 		}
 		if e.consecFail >= threshold {
 			if e.state != StateBlocked {

@@ -253,15 +253,14 @@ func (t *Terminator) observe(key string, status int, encoding string, prefix []b
 		res := probe.Classify(status, probe.Decode(prefix, encoding), latency)
 		if res.Verdict == pool.VerdictBlocked {
 			t.Pool.Record(key, pool.VerdictBlocked, latency, res.Detail)
-			// Only ask for deletion once the threshold is actually reached; the
-			// scheduler's ClaimEviction would also refuse below it, but handing
-			// every single blocked response over would queue pointless work.
-			if t.Evictor != nil && t.Pool.Blocked(key) {
-				t.Log.Info("egress blocked by live traffic", "route", key, "detail", res.Detail)
-			}
+			t.Log.Info("egress blocked by live traffic", "route", key, "detail", res.Detail)
+			t.evictIfBlocked(key)
+			return
 		}
-		t.evictIfBlocked(key)
-		return
+		// A 403 that is not the egress being blocked is still a request this
+		// route failed to serve, so it falls through to the failure below.
+		// Dropping it here would let a route answer 403 forever and never be
+		// counted, which is exactly the case the pool exists to catch.
 	}
 	if status == http.StatusBadRequest {
 		t.Pool.Record(key, pool.VerdictBadRequest, latency, "upstream 400")

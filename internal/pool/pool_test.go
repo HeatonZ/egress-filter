@@ -32,23 +32,36 @@ func seed(p *Pool, keys ...string) {
 	p.Sync(routes)
 }
 
+// A blocked egress is withdrawn on its first response: it is proven dead for
+// this upstream, so every further request through it is wasted.
 func TestBlockedAfterThreshold(t *testing.T) {
 	p := testPool()
 	seed(p, "a")
 
-	// Four failures are not enough: the threshold is five consecutive.
-	for i := 1; i <= 4; i++ {
-		p.Record("a", VerdictBlocked, time.Millisecond, "blocked")
-		if got := p.Snapshots()[0].State; got != StateSuspect {
-			t.Fatalf("after %d failures state = %v, want suspect", i, got)
-		}
-	}
 	p.Record("a", VerdictBlocked, time.Millisecond, "blocked")
 	if got := p.Snapshots()[0].State; got != StateBlocked {
-		t.Fatalf("after five failures state = %v, want blocked", got)
+		t.Fatalf("state after one blocked = %v, want blocked", got)
 	}
 	if _, ok := p.Pick(); ok {
 		t.Fatal("a blocked route must not be picked")
+	}
+}
+
+// The blocked threshold is a knob: raising it restores the old probation
+// behaviour where a single 403 only makes the route suspect.
+func TestBlockedThresholdIsConfigurable(t *testing.T) {
+	p := New(Options{BlockedThreshold: 3})
+	seed(p, "a")
+
+	for i := 0; i < 2; i++ {
+		p.Record("a", VerdictBlocked, time.Millisecond, "blocked")
+	}
+	if got := p.Snapshots()[0].State; got != StateSuspect {
+		t.Fatalf("state after two blocked with threshold 3 = %v, want suspect", got)
+	}
+	p.Record("a", VerdictBlocked, time.Millisecond, "blocked")
+	if got := p.Snapshots()[0].State; got != StateBlocked {
+		t.Fatalf("state after three blocked with threshold 3 = %v, want blocked", got)
 	}
 }
 
@@ -58,8 +71,10 @@ func TestSuccessResetsFailureStreak(t *testing.T) {
 	p := testPool()
 	seed(p, "a")
 
+	// Use the ordinary-failure verdict: a blocked 403 withdraws on its own
+	// threshold, so it cannot demonstrate a streak.
 	for i := 0; i < 4; i++ {
-		p.Record("a", VerdictBlocked, time.Millisecond, "blocked")
+		p.Record("a", VerdictServerError, time.Millisecond, "upstream 500")
 	}
 	p.Record("a", VerdictOK, time.Millisecond, "ok")
 	if got := p.Snapshots()[0].ConsecFail; got != 0 {
@@ -69,7 +84,7 @@ func TestSuccessResetsFailureStreak(t *testing.T) {
 	// Four more failures still must not withdraw it, because the streak
 	// restarted.
 	for i := 0; i < 4; i++ {
-		p.Record("a", VerdictBlocked, time.Millisecond, "blocked")
+		p.Record("a", VerdictServerError, time.Millisecond, "upstream 500")
 	}
 	if got := p.Snapshots()[0].State; got == StateBlocked {
 		t.Fatal("route withdrawn after a success restarted the streak")
@@ -156,12 +171,13 @@ func TestPickRotates(t *testing.T) {
 	}
 }
 
-// Only a route with positive evidence of a block is withheld. One failure is
-// not enough: under passive observation nothing would ever clear it.
+// Only a route with positive evidence of a block is withheld. An ordinary
+// failure is not enough: under passive observation nothing would ever clear it
+// while the route still gets selected for a reason other than being blocked.
 func TestSuspectStaysSelectable(t *testing.T) {
 	p := testPool()
 	seed(p, "a")
-	p.Record("a", VerdictBlocked, time.Millisecond, "")
+	p.Record("a", VerdictServerError, time.Millisecond, "upstream 500")
 	if got := p.Snapshots()[0].State; got != StateSuspect {
 		t.Fatalf("state = %v, want suspect", got)
 	}

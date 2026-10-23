@@ -100,26 +100,29 @@ func TestTerminateSeesBlockedStatus(t *testing.T) {
 	if resp.StatusCode != 403 {
 		t.Fatalf("upstream did not answer 403, got %d", resp.StatusCode)
 	}
-	// One failure is below the threshold, so the route is only suspect.
+	// One blocked 403 is enough now: the egress is proven dead.
 	waitFor(t, func() bool { return snapshotOf(p, "leaseA").ConsecFail == 1 })
-	if got := snapshotOf(p, "leaseA").State; got != pool.StateSuspect {
-		t.Fatalf("state after one blocked = %v, want suspect", got)
+	if got := snapshotOf(p, "leaseA").State; got != pool.StateBlocked {
+		t.Fatalf("state after one blocked = %v, want blocked", got)
 	}
-	if ev.count() != 0 {
-		t.Fatal("evicted below the failure threshold")
+	if ev.count() != 1 {
+		t.Fatalf("evictor called %d times after one blocked 403, want 1", ev.count())
 	}
 }
 
 // The upstream uses the same 403 for "you are not the OpenCode client". That
-// says nothing about the egress and must not count toward withdrawal, or a
-// single misconfigured caller would drain the pool.
-func TestTerminateIgnoresShapeRejection(t *testing.T) {
+// says nothing about the egress, so it must not rotate the lease on its own —
+// but it is still a request this route failed to serve, so it counts toward the
+// ordinary failure streak. Dropping it entirely would let a route answer 403
+// forever and never be counted.
+func TestTerminateShapeRejectionCountsButDoesNotRotate(t *testing.T) {
 	up := upstreamServer(t, http.StatusForbidden,
 		`{"type":"error","error":{"type":"FreeTierError","message":"OpenCode's free tier can only `+
 			`be used from within OpenCode. Download it at https://opencode.ai and keep building."}}`, nil)
 
 	p := seeded()
-	tt := newTestTerminator(t, p, &recordingEvictor{})
+	ev := &recordingEvictor{}
+	tt := newTestTerminator(t, p, ev)
 	tt.dial = directTo(t, up)
 	tt.UpstreamRoots = rootsFor(t, up)
 	proxy := httptest.NewServer(tt)
@@ -128,14 +131,19 @@ func TestTerminateIgnoresShapeRejection(t *testing.T) {
 	resp := doThroughProxy(t, proxy.URL, tt.CA, upstreamHost(up), "leaseA", `{}`)
 	defer resp.Body.Close()
 
-	// The verdict is applied after the response is written, so give the
-	// handler a moment before asserting that nothing was recorded.
+	// Exactly one ordinary failure, and no rotation: a misconfigured caller
+	// must not drain the pool.
+	waitFor(t, func() bool { return snapshotOf(p, "leaseA").ConsecFail >= 1 })
 	time.Sleep(50 * time.Millisecond)
-	if got := snapshotOf(p, "leaseA").ConsecFail; got != 0 {
-		t.Fatalf("shape rejection counted as %d failures, want 0", got)
+	s := snapshotOf(p, "leaseA")
+	if s.ConsecFail != 1 {
+		t.Fatalf("shape rejection counted as %d failures, want 1", s.ConsecFail)
 	}
-	if got := snapshotOf(p, "leaseA").State; got != pool.StateReady {
-		t.Fatalf("state = %v, want ready", got)
+	if s.LastVerdict != pool.VerdictServerError {
+		t.Fatalf("verdict = %v, want server_error", s.LastVerdict)
+	}
+	if s.State == pool.StateBlocked || ev.count() != 0 {
+		t.Fatalf("shape rejection rotated the lease: state=%v evictions=%d", s.State, ev.count())
 	}
 }
 
@@ -190,9 +198,9 @@ func TestTerminateCountsRateLimit(t *testing.T) {
 	}
 }
 
-// Five consecutive failures must withdraw the route and hand it to the
-// evictor; the threshold is the user-visible knob, so it is pinned here.
-func TestTerminateEvictsAfterThreshold(t *testing.T) {
+// A blocked 403 withdraws the route on its first response and hands it to the
+// evictor, so the next request goes out through a fresh lease.
+func TestTerminateEvictsOnFirstBlockedResponse(t *testing.T) {
 	up := upstreamServer(t, http.StatusForbidden,
 		`{"type":"error","error":{"type":"FreeTierError","message":"OpenCode's free models `+
 			`aren't available from your current network because we've detected abusive traffic `+
@@ -204,16 +212,6 @@ func TestTerminateEvictsAfterThreshold(t *testing.T) {
 	tt.UpstreamRoots = rootsFor(t, up)
 	proxy := httptest.NewServer(tt)
 	defer proxy.Close()
-
-	for i := 0; i < 4; i++ {
-		resp := doThroughProxy(t, proxy.URL, tt.CA, upstreamHost(up), "leaseA", `{}`)
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-	}
-	waitFor(t, func() bool { return snapshotOf(p, "leaseA").ConsecFail >= 4 })
-	if got := snapshotOf(p, "leaseA").State; got == pool.StateBlocked {
-		t.Fatal("withdrawn before reaching the threshold")
-	}
 
 	resp := doThroughProxy(t, proxy.URL, tt.CA, upstreamHost(up), "leaseA", `{}`)
 	io.Copy(io.Discard, resp.Body)

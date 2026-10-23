@@ -45,6 +45,7 @@ func main() {
 
 	p := pool.New(pool.Options{
 		FailThreshold:      cfg.FailThreshold,
+		BlockedThreshold:   cfg.BlockedThreshold,
 		RateLimitThreshold: cfg.RateLimitThreshold,
 		RecoverThreshold:   cfg.RecoverThreshold,
 		LazyTTL:            cfg.LazyTTL,
@@ -244,6 +245,10 @@ type config struct {
 	DiscoveryInterval time.Duration
 	ProbeConcurrency  int
 	FailThreshold     int
+	// BlockedThreshold is how many consecutive blocked 403s withdraw a route.
+	// Separate from FailThreshold because a blocked egress is dead for this
+	// upstream, so one is enough by default.
+	BlockedThreshold int
 	// RateLimitThreshold is how many consecutive 429s withdraw a route. It is
 	// kept separate from FailThreshold because a rate-limited egress is out of
 	// quota now, not merely unlucky, and the caller wants it rotated at once.
@@ -290,6 +295,9 @@ func loadConfig() config {
 		DiscoveryInterval: duration("EF_DISCOVERY_INTERVAL", 60*time.Second),
 		ProbeConcurrency:  integer("EF_PROBE_CONCURRENCY", 4),
 		FailThreshold:     integer("EF_FAIL_THRESHOLD", 5),
+		// One blocked 403 is enough: the egress is proven dead for this
+		// upstream, so every further request through it is wasted.
+		BlockedThreshold: integer("EF_BLOCKED_THRESHOLD", 1),
 		// One 429 is enough: the egress is out of quota right now, and
 		// continuing to use it only burns the caller's request. Set this to a
 		// higher number to make 429s share the ordinary failure streak.

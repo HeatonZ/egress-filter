@@ -75,19 +75,19 @@ func TestPassiveDetectsBlockedEgress(t *testing.T) {
 	srv := httptest.NewServer(r)
 	defer srv.Close()
 
-	for i := 0; i < 5; i++ {
-		resp, err := http.Get(srv.URL + "/tok/opencode.leaseA/https/opencode.ai/inference/v1/chat/completions")
-		if err != nil {
-			t.Fatal(err)
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode != 403 {
-			t.Fatalf("status = %d, want 403 passthrough", resp.StatusCode)
-		}
+	// The first blocked 403 withdraws the route, so only the first request can
+	// pass a 403 through; the rest already find no egress. Send one and assert
+	// the rotation, then let the pool report the withdrawal.
+	resp, err := http.Get(srv.URL + "/tok/opencode.leaseA/https/opencode.ai/inference/v1/chat/completions")
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	waitFor(t, func() bool { return snapshotFor(p, "leaseA").ConsecFail >= 5 })
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 403 {
+		t.Fatalf("status = %d, want 403 passthrough", resp.StatusCode)
+	}
+	waitFor(t, func() bool { return snapshotFor(p, "leaseA").ConsecFail >= 1 })
 	var snap pool.Snapshot
 	for _, s := range p.Snapshots() {
 		if s.Key == "leaseA" {
@@ -95,7 +95,7 @@ func TestPassiveDetectsBlockedEgress(t *testing.T) {
 		}
 	}
 	if snap.State != pool.StateBlocked {
-		t.Fatalf("state = %v, want blocked after five gzipped blocked responses", snap.State)
+		t.Fatalf("state = %v, want blocked after one gzipped blocked response", snap.State)
 	}
 	if snap.LastVerdict != pool.VerdictBlocked {
 		t.Fatalf("verdict = %v, want blocked", snap.LastVerdict)
@@ -149,7 +149,10 @@ func TestPassiveSuccessClearsFailures(t *testing.T) {
 		m := mode
 		mu.Unlock()
 		if m == 0 {
-			gzipped(t, w, 403, `{"error":{"message":"abusive traffic from this IP address"}}`)
+			// An ordinary failure, not a blocked 403: a blocked 403 withdraws the
+			// route on its first response now, so it cannot build a suspect
+			// state that a later success is supposed to clear.
+			gzipped(t, w, 500, `{"error":{"message":"upstream exploded"}}`)
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
