@@ -246,7 +246,16 @@ func (r *Reverse) observe(key string, status int, encoding string, prefix []byte
 		return
 	}
 
-	// Every remaining non-2xx — 429, 5xx, an unclassified 403 — is a failure.
+	// A 429 is its own verdict: the egress is out of quota right now, so the
+	// route is rotated on its first one instead of waiting for the shared
+	// failure streak.
+	if status == http.StatusTooManyRequests {
+		r.Pool.Record(key, pool.VerdictRateLimited, latency, "upstream 429")
+		r.evictIfBlocked(key)
+		return
+	}
+
+	// Every remaining non-2xx — 5xx, an unclassified 403 — is a failure.
 	r.Pool.Record(key, pool.VerdictServerError, latency, "upstream "+strconv.Itoa(status))
 	r.evictIfBlocked(key)
 }

@@ -268,7 +268,15 @@ func (t *Terminator) observe(key string, status int, encoding string, prefix []b
 		t.evictIfBlocked(key)
 		return
 	}
-	// Every remaining non-2xx — 429, 5xx, an unclassified 403 — is a failure.
+	// A 429 is its own verdict: the egress is out of quota right now, so the
+	// route is rotated on its first one instead of waiting for the shared
+	// failure streak.
+	if status == http.StatusTooManyRequests {
+		t.Pool.Record(key, pool.VerdictRateLimited, latency, "upstream 429")
+		t.evictIfBlocked(key)
+		return
+	}
+	// Every remaining non-2xx — 5xx, an unclassified 403 — is a failure.
 	t.Pool.Record(key, pool.VerdictServerError, latency, "upstream "+strconv.Itoa(status))
 	t.evictIfBlocked(key)
 }

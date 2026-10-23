@@ -33,9 +33,14 @@ const (
 	VerdictBlocked
 	// VerdictBadRequest means the request shape was rejected.
 	VerdictBadRequest
-	// VerdictServerError means the upstream answered non-2xx (5xx, 429, an
+	// VerdictServerError means the upstream answered non-2xx (5xx, an
 	// unclassified 403). It counts like any other failure.
 	VerdictServerError
+	// VerdictRateLimited means the upstream answered 429: this egress is out
+	// of quota right now. It is a separate verdict because it is acted on
+	// immediately — the caller asked for a fresh egress on the first 429
+	// rather than after the shared failure threshold.
+	VerdictRateLimited
 	// VerdictTimeout means the route did not deliver a response in time.
 	VerdictTimeout
 )
@@ -50,6 +55,8 @@ func (v Verdict) String() string {
 		return "bad_request"
 	case VerdictServerError:
 		return "server_error"
+	case VerdictRateLimited:
+		return "rate_limited"
 	case VerdictTimeout:
 		return "timeout"
 	default:
@@ -117,6 +124,12 @@ type Options struct {
 	// success resets the streak: a route that still serves traffic is not
 	// blocked, however many failures it had before.
 	FailThreshold int
+	// RateLimitThreshold is how many consecutive 429s withdraw a route. It is
+	// separate from FailThreshold because a rate-limited egress is out of
+	// quota right now, not merely unlucky: waiting for the shared threshold
+	// keeps sending requests to a node that will not serve them. 1 rotates on
+	// the first 429.
+	RateLimitThreshold int
 	// RecoverThreshold is how many consecutive successes return a blocked
 	// route to ready.
 	RecoverThreshold int
@@ -143,6 +156,9 @@ type Options struct {
 func (o Options) withDefaults() Options {
 	if o.FailThreshold <= 0 {
 		o.FailThreshold = 5
+	}
+	if o.RateLimitThreshold <= 0 {
+		o.RateLimitThreshold = 1
 	}
 	if o.RecoverThreshold <= 0 {
 		o.RecoverThreshold = 2
@@ -334,9 +350,18 @@ func (p *Pool) Record(key string, v Verdict, latency time.Duration, detail strin
 		// 4xx, 5xx, timeout and dial failure stay distinguishable in lastDetail
 		// for operators, but the count does not care — five in a row withdraws
 		// the route whatever produced them.
+		//
+		// A 429 is the exception: it means this egress is out of quota right
+		// now, so it is withdrawn on its own threshold (1 by default) instead
+		// of waiting for the shared streak. The failure count still advances so
+		// /status and the logs tell the same story as any other failure.
 		e.consecFail++
 		e.consecOK = 0
-		if e.consecFail >= p.opts.FailThreshold {
+		threshold := p.opts.FailThreshold
+		if v == VerdictRateLimited {
+			threshold = p.opts.RateLimitThreshold
+		}
+		if e.consecFail >= threshold {
 			if e.state != StateBlocked {
 				e.blockedAt = now
 			}

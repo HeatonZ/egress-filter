@@ -159,13 +159,15 @@ func TestTerminateSuccessRecordsOK(t *testing.T) {
 	}
 }
 
-// A 429 counts like every other non-2xx: the route did not serve the request,
-// so five in a row rotate it.
+// A single 429 withdraws the route: the egress is out of quota right now, so
+// waiting for the shared failure streak would keep sending requests to a node
+// that cannot serve them.
 func TestTerminateCountsRateLimit(t *testing.T) {
 	up := upstreamServer(t, http.StatusTooManyRequests,
 		`{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded."}}`, nil)
 	p := seeded()
-	tt := newTestTerminator(t, p, &recordingEvictor{})
+	ev := &recordingEvictor{}
+	tt := newTestTerminator(t, p, ev)
 	tt.dial = directTo(t, up)
 	tt.UpstreamRoots = rootsFor(t, up)
 	proxy := httptest.NewServer(tt)
@@ -177,9 +179,14 @@ func TestTerminateCountsRateLimit(t *testing.T) {
 
 	waitFor(t, func() bool { return snapshotOf(p, "leaseA").ConsecFail > 0 })
 	s0 := snapshotOf(p, "leaseA")
-	if s0.ConsecFail != 1 || s0.State != pool.StateSuspect {
-		t.Fatalf("429 recorded as %d failures in state %v, want 1 failure in suspect",
-			s0.ConsecFail, s0.State)
+	if s0.ConsecFail != 1 {
+		t.Fatalf("429 recorded as %d failures, want 1", s0.ConsecFail)
+	}
+	if s0.State != pool.StateBlocked {
+		t.Fatalf("state = %v after a single 429, want blocked", s0.State)
+	}
+	if got := ev.count(); got != 1 {
+		t.Fatalf("evictor called %d times after a single 429, want 1", got)
 	}
 }
 

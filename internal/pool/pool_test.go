@@ -308,6 +308,44 @@ func TestServerErrorCountsAndSuccessResetsIt(t *testing.T) {
 	}
 }
 
+// A 429 is acted on immediately: the egress is out of quota right now, so one
+// rate-limited response withdraws the route without waiting for the shared
+// failure streak.
+func TestRateLimitWithdrawsOnFirstResponse(t *testing.T) {
+	p := testPool()
+	seed(p, "a")
+
+	p.Record("a", VerdictRateLimited, time.Second, "upstream 429")
+	s := p.Snapshots()[0]
+	if s.State != StateBlocked {
+		t.Fatalf("state after one 429 = %v, want blocked", s.State)
+	}
+	if s.ConsecFail != 1 {
+		t.Fatalf("consecFail after one 429 = %d, want 1", s.ConsecFail)
+	}
+	if !p.Blocked("a") {
+		t.Fatal("route not withheld after a single 429")
+	}
+}
+
+// The 429 threshold is a knob, not a hard-coded one: raising it makes a
+// rate-limited response share the ordinary failure streak.
+func TestRateLimitThresholdIsConfigurable(t *testing.T) {
+	p := New(Options{RateLimitThreshold: 3})
+	seed(p, "a")
+
+	for i := 0; i < 2; i++ {
+		p.Record("a", VerdictRateLimited, time.Second, "upstream 429")
+	}
+	if got := p.Snapshots()[0].State; got != StateSuspect {
+		t.Fatalf("state after two 429s with threshold 3 = %v, want suspect", got)
+	}
+	p.Record("a", VerdictRateLimited, time.Second, "upstream 429")
+	if got := p.Snapshots()[0].State; got != StateBlocked {
+		t.Fatalf("state after three 429s with threshold 3 = %v, want blocked", got)
+	}
+}
+
 // A withdrawal is a pause, never a retirement. Whatever path failed to release
 // it, an egress must come back inside BlockedTTL — otherwise a route that is
 // never selected can never record the success that would clear it.

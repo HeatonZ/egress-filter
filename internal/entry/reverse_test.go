@@ -76,6 +76,38 @@ func TestReverseRewritesAccountAndPath(t *testing.T) {
 	}
 }
 
+// A 429 on live traffic withdraws the route on the first response and hands it
+// to the evictor, so the next request goes out through a fresh egress.
+func TestReverseRotatesOnFirstRateLimit(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		io.WriteString(w, `{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded."}}`)
+	}))
+	defer fake.Close()
+
+	p := seeded()
+	ev := &recordingEvictor{}
+	r := NewReverse(p, fake.URL, "opencode", quietLogger())
+	r.Evictor = ev
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/tok/opencode.leaseB/https/opencode.ai/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 passed through to the caller", resp.StatusCode)
+	}
+	waitFor(t, func() bool { return p.Blocked("leaseB") })
+	if got := ev.count(); got != 1 {
+		t.Fatalf("evictor called %d times after a single 429, want 1", got)
+	}
+}
+
 // A healthy requested account is honoured, because one account is one egress
 // and switching egress pads the upstream's prompt cache.
 func TestReverseHonoursHealthyAccount(t *testing.T) {

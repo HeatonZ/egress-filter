@@ -44,10 +44,11 @@ func main() {
 	}
 
 	p := pool.New(pool.Options{
-		FailThreshold:    cfg.FailThreshold,
-		RecoverThreshold: cfg.RecoverThreshold,
-		LazyTTL:          cfg.LazyTTL,
-		BlockedTTL:       cfg.BlockedTTL,
+		FailThreshold:      cfg.FailThreshold,
+		RateLimitThreshold: cfg.RateLimitThreshold,
+		RecoverThreshold:   cfg.RecoverThreshold,
+		LazyTTL:            cfg.LazyTTL,
+		BlockedTTL:         cfg.BlockedTTL,
 	})
 	// One registry is shared by every entry: a route carries the name of the
 	// Resin instance that owns its lease, and the entry dials that instance with
@@ -243,9 +244,13 @@ type config struct {
 	DiscoveryInterval time.Duration
 	ProbeConcurrency  int
 	FailThreshold     int
-	RecoverThreshold  int
-	Evict             bool
-	EvictCooldown     time.Duration
+	// RateLimitThreshold is how many consecutive 429s withdraw a route. It is
+	// kept separate from FailThreshold because a rate-limited egress is out of
+	// quota now, not merely unlucky, and the caller wants it rotated at once.
+	RateLimitThreshold int
+	RecoverThreshold   int
+	Evict              bool
+	EvictCooldown      time.Duration
 	// LazyTTL expires a route a client named that discovery never lists.
 	LazyTTL time.Duration
 	// BlockedTTL bounds how long a route stays withdrawn before it is reopened
@@ -285,12 +290,16 @@ func loadConfig() config {
 		DiscoveryInterval: duration("EF_DISCOVERY_INTERVAL", 60*time.Second),
 		ProbeConcurrency:  integer("EF_PROBE_CONCURRENCY", 4),
 		FailThreshold:     integer("EF_FAIL_THRESHOLD", 5),
-		RecoverThreshold:  integer("EF_RECOVER_THRESHOLD", 2),
-		Evict:             boolean("EF_EVICT", false),
-		EvictCooldown:     duration("EF_EVICT_COOLDOWN", 10*time.Minute),
-		LazyTTL:           duration("EF_LAZY_TTL", 10*time.Minute),
-		BlockedTTL:        duration("EF_BLOCKED_TTL", 2*time.Minute),
-		HeaderTimeout:     duration("EF_UPSTREAM_HEADER_TIMEOUT", 60*time.Second),
+		// One 429 is enough: the egress is out of quota right now, and
+		// continuing to use it only burns the caller's request. Set this to a
+		// higher number to make 429s share the ordinary failure streak.
+		RateLimitThreshold: integer("EF_RATE_LIMIT_THRESHOLD", 1),
+		RecoverThreshold:   integer("EF_RECOVER_THRESHOLD", 2),
+		Evict:              boolean("EF_EVICT", false),
+		EvictCooldown:      duration("EF_EVICT_COOLDOWN", 10*time.Minute),
+		LazyTTL:            duration("EF_LAZY_TTL", 10*time.Minute),
+		BlockedTTL:         duration("EF_BLOCKED_TTL", 2*time.Minute),
+		HeaderTimeout:      duration("EF_UPSTREAM_HEADER_TIMEOUT", 60*time.Second),
 	}
 	// The aggregator password defaults to the old single-instance token so an
 	// existing deployment keeps working without a new variable.
