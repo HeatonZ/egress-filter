@@ -84,8 +84,15 @@ real requests going to a node that could not serve them. Everything else — a
 5xx, a timeout, a 403 that is not the request shape — still needs the full
 streak. Set it higher to make 429s share the ordinary streak.
 
-The failure count advances either way, so `/status` and the logs read the same
-as for any other failure.
+**A blocked 403 is acted on separately too.** When the body names this egress
+(abusive traffic, free tier not available from your network), the egress is
+proven dead for this upstream, so it is withdrawn on `EF_BLOCKED_THRESHOLD`
+consecutive responses (default `1`). A 403 that blames the request shape is a
+configuration problem: it counts toward the ordinary streak but does not
+rotate the lease, because draining the pool would not fix it.
+
+The failure count advances in every case, so `/status` and the logs read the
+same as for any other failure.
 
 Be aware of the trade-off: if the *whole pool* is answering 429, one-response
 rotation churns every lease and fixes nothing, because the shortage is upstream
@@ -154,7 +161,8 @@ Eviction is **off by default**. Run a while with `EF_EVICT=false` and read
 | `EF_LISTEN_TERMINATE` | *(off)* | TLS-terminating forward entry; empty disables it |
 | `EF_CA_DIR` | `/data/ca` | where the signing CA is stored; must persist |
 | `EF_DISCOVERY_INTERVAL` | `60s` | lease refresh |
-| `EF_FAIL_THRESHOLD` | `5` | consecutive blocked responses before withdrawal |
+| `EF_FAIL_THRESHOLD` | `5` | consecutive ordinary failures before withdrawal |
+| `EF_BLOCKED_THRESHOLD` | `1` | consecutive blocked 403s before withdrawal; a blocked egress is dead, not unlucky |
 | `EF_RATE_LIMIT_THRESHOLD` | `1` | consecutive 429s before withdrawal; separate because a 429 is a quota state, not bad luck |
 | `EF_EVICT` | `false` | delete leases of blocked routes |
 | `EF_EVICT_COOLDOWN` | `10m` | minimum gap between deletions of one account |
